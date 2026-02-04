@@ -3,6 +3,9 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import numpy as np
+import json
+import argparse
+
 
 class Handtracking:
     MODEL_PATH = "hand_landmarker.task"
@@ -19,7 +22,7 @@ class Handtracking:
     THICKNESS = 2
     RADIUS = 4
 
-    def __init__(self):
+    def __init__(self, udp_ip='127.0.0.1', udp_port=5005):
         self.hand_height_cm = 17.0  # measured real hand size cm (wrist to middle tip)
         self.ref_dist_1 = 15.0      # cm
         self.ref_dist_2 = 20.0      # cm
@@ -31,8 +34,16 @@ class Handtracking:
         self.f_times_H = None
         self.calibrated = False
 
+        self.callback_number = 0
+
         print(f"Press '1' to calibrate at {self.ref_dist_1}cm, then '2' at {self.ref_dist_2}cm from the camera (palm facing camera for orientation calibration).")
         print("Press ESC to quit.")
+
+        # UDP setup
+        import socket
+        self.udp_ip = udp_ip
+        self.udp_port = udp_port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
         BaseOptions = python.BaseOptions
         HandLandmarkerOptions = vision.HandLandmarkerOptions
@@ -121,6 +132,21 @@ class Handtracking:
         return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
 
 
+    def rpy_to_quat(self, roll, pitch, yaw):
+        cy = np.cos(np.radians(yaw) * 0.5)
+        sy = np.sin(np.radians(yaw) * 0.5)
+        cp = np.cos(np.radians(pitch) * 0.5)
+        sp = np.sin(np.radians(pitch) * 0.5)
+        cr = np.cos(np.radians(roll) * 0.5)
+        sr = np.sin(np.radians(roll) * 0.5)
+
+        qw = cr * cp * cy + sr * sp * sy
+        qx = sr * cp * cy - cr * sp * sy
+        qy = cr * sp * cy + sr * cp * sy
+        qz = cr * cp * sy - sr * sp * cy
+        return (qx, qy, qz, qw)
+
+
     def tracking_loop(self):
         cap = cv2.VideoCapture(0)
         frame_timestamp_ms = 0
@@ -190,10 +216,16 @@ class Handtracking:
                     cv2.arrowedLine(annotated, origin, end_z, (255, 0, 0), 3, tipLength=0.2)
 
                     key = cv2.waitKey(1) & 0xFF
-                    if key == ord('1'):
+                    if key == ord('9'):
                         self.calibrate_step1(hand_size_px, z_axis)
-                    if key == ord('2'):
+                    elif key == ord('0'):
                         self.calibrate_step2(hand_size_px)
+                    elif key == ord('1'):
+                        self.callback_number = 1
+                    elif key == ord('2'):
+                        self.callback_number = 2
+                    elif key == ord('3'):
+                        self.callback_number = 3
 
                     if self.calibrated:
                         z = self.f_times_H / hand_size_px
@@ -203,6 +235,7 @@ class Handtracking:
                         hand_poses.append((x, y, z, roll, pitch, yaw))
 
             if hand_poses:
+                # Separate left and right hands based on x position
                 left_hand = hand_poses[0]
                 right_hand = None
                 if len(hand_poses) > 1:
@@ -212,12 +245,30 @@ class Handtracking:
                         left_hand = hand_poses[1]
                         right_hand = hand_poses[0]
 
+                # Print hand poses
                 output = ""
                 if (left_hand is not None):
                     output = f"Left Hand: x={left_hand[0]:.2f} y={left_hand[1]:.2f} z={left_hand[2]:.2f} R={left_hand[3]:.1f} P={left_hand[4]:.1f} Y={left_hand[5]:.1f}\t\t|\t\t"
                 if (right_hand is not None):
                     output += f"Right Hand: x={right_hand[0]:.2f} y={right_hand[1]:.2f} z={right_hand[2]:.2f} R={right_hand[3]:.1f} P={right_hand[4]:.1f} Y={right_hand[5]:.1f}"
                 print(output)
+
+                if self.callback_number > 0:
+                    print(f"Sending callback number: {self.callback_number}")
+
+                # Convert from rpy to quaternion
+                quat_left = self.rpy_to_quat(left_hand[3], left_hand[4], left_hand[5])
+                quat_right = (0.0, 0.0, 0.0, 1.0)
+                if right_hand is not None:
+                    quat_right = self.rpy_to_quat(right_hand[3], right_hand[4], right_hand[5])
+                else:
+                    right_hand = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+                # Send UDP packet with pose data as JSON
+                pose_data = left_hand[0:3] + quat_left + right_hand[0:3] + quat_right + (float(self.callback_number),)
+                msg = np.array(pose_data, dtype=np.float32).tobytes()
+                self.sock.sendto(msg, (self.udp_ip, self.udp_port))
+                self.callback_number = 0  # reset after sending
 
             cv2.imshow('Hand Landmarker (Pure Tasks + Manual Draw)', annotated)
             if cv2.waitKey(5) & 0xFF == 27:
@@ -228,6 +279,11 @@ class Handtracking:
         self.landmarker.close()
         print("Done.")
 
+
 if __name__ == "__main__":
-    ht = Handtracking()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--udp_ip', type=str, default='127.0.0.1', help='UDP target IP')
+    parser.add_argument('--udp_port', type=int, default=5005, help='UDP target port')
+    args = parser.parse_args()
+    ht = Handtracking(udp_ip=args.udp_ip, udp_port=args.udp_port)
     ht.tracking_loop()
