@@ -5,6 +5,7 @@ from mediapipe.tasks.python import vision
 import numpy as np
 import json
 import argparse
+from scipy.spatial.transform import Rotation as R
 
 
 class Handtracking:
@@ -114,39 +115,6 @@ class Handtracking:
         print(f"cm/px at {self.ref_dist_2}cm: {self.cm_per_px_2:.5f}")
 
 
-    def vector(self, p1, p2):
-        return np.array([p2.x - p1.x, p2.y - p1.y, p2.z - p1.z])
-
-
-    def normalized_vector(self, v):
-        norm = np.linalg.norm(v)
-        if norm == 0:
-            return v
-        return v / norm
-
-
-    def rot_matrix_to_rpy(self, R):
-        yaw = np.arctan2(R[1,0], R[0,0])
-        pitch = np.arctan2(-R[2,0], np.sqrt(R[2,1]**2 + R[2,2]**2))
-        roll = np.arctan2(R[2,1], R[2,2])
-        return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
-
-
-    def rpy_to_quat(self, roll, pitch, yaw):
-        cy = np.cos(np.radians(yaw) * 0.5)
-        sy = np.sin(np.radians(yaw) * 0.5)
-        cp = np.cos(np.radians(pitch) * 0.5)
-        sp = np.sin(np.radians(pitch) * 0.5)
-        cr = np.cos(np.radians(roll) * 0.5)
-        sr = np.sin(np.radians(roll) * 0.5)
-
-        qw = cr * cp * cy + sr * sp * sy
-        qx = sr * cp * cy - cr * sp * sy
-        qy = cr * sp * cy + sr * cp * sy
-        qz = cr * cp * sy - sr * sp * cy
-        return (qx, qy, qz, qw)
-
-
     def tracking_loop(self):
         cap = cv2.VideoCapture(0)
         frame_timestamp_ms = 0
@@ -164,6 +132,13 @@ class Handtracking:
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
             result = self.landmarker.detect_for_video(mp_image, frame_timestamp_ms)
             annotated = image.copy()
+
+            if len(result.hand_landmarks) > 1:
+                hand_distance = np.linalg.norm(np.array([result.hand_landmarks[0][0].x - result.hand_landmarks[1][0].x,
+                                                          result.hand_landmarks[0][0].y - result.hand_landmarks[1][0].y]))
+                if hand_distance < 0.25:
+                    print(f"Warning: Hands are very close ({hand_distance:.3f}), removing second hand.")
+                    result.hand_landmarks.pop(1)
 
             hand_poses = []
             if result.hand_landmarks:
@@ -184,29 +159,42 @@ class Handtracking:
                         cv2.circle(annotated, px, self.RADIUS, self.LANDMARK_COLOR, -1)
 
                     # Calibration and Z estimation
-                    wrist = hand_landmarks[0]
-                    pt_5 = hand_landmarks[5]
-                    pt_9 = hand_landmarks[9]
-                    pt_17 = hand_landmarks[17]
+                    wrist = np.array([hand_landmarks[0].x, hand_landmarks[0].y, hand_landmarks[0].z])
+                    index_mcp = np.array([hand_landmarks[5].x, hand_landmarks[5].y, hand_landmarks[5].z])
+                    middle_mcp = np.array([hand_landmarks[9].x, hand_landmarks[9].y, hand_landmarks[9].z])
+                    pinky_mcp = np.array([hand_landmarks[17].x, hand_landmarks[17].y, hand_landmarks[17].z])
 
-                    wrist_px = np.array([wrist.x * w, wrist.y * h])
-                    middle_px = np.array([pt_9.x * w, pt_9.y * h])
+                    wrist_px = np.array([wrist[0] * w, wrist[1] * h])
+                    middle_px = np.array([middle_mcp[0] * w, middle_mcp[1] * h])
                     hand_size_px = np.linalg.norm(wrist_px - middle_px)
 
                     # Palm normal calculation
-                    vec_05 = self.vector(pt_5, wrist)
-                    vec_017 = self.vector(pt_17, wrist)
-                    vec_09 = self.vector(pt_9, wrist)
+                    vec_index = index_mcp - wrist
+                    vec_pinky = pinky_mcp - wrist
+                    vec_middle = middle_mcp - wrist
 
-                    x_axis = self.normalized_vector(vec_09)
-                    z_axis = self.normalized_vector(np.cross(vec_05, vec_017))
-                    y_axis = self.normalized_vector(np.cross(z_axis, x_axis))
+                    z_axis = -vec_middle / np.linalg.norm(vec_middle)
+                    y_axis = np.cross(vec_index, vec_pinky)
+                    y_axis /= np.linalg.norm(y_axis)
+                    x_axis = np.cross(y_axis, z_axis)
+                    x_axis /= np.linalg.norm(x_axis)
 
-                    R = np.column_stack((x_axis, y_axis, z_axis))
-                    roll, pitch, yaw = self.rot_matrix_to_rpy(R)
+                    rot_mat = np.column_stack((x_axis, y_axis, z_axis))
+
+                    # Apply reorientation matrix
+                    reorient_mat = np.array(
+                        [
+                            [0, 0, 1],
+                            [1, 0, 0],
+                            [0, 1, 0],
+                        ]
+                    )
+                    rot_mat = rot_mat @ reorient_mat
+
+                    quat = R.from_matrix(rot_mat).as_quat()
 
                     # Draw axes
-                    origin = (int(wrist.x * w), int(wrist.y * h))
+                    origin = (int(wrist[0] * w), int(wrist[1] * h))
                     scale = 80
                     end_x = (int(origin[0] + x_axis[0] * scale), int(origin[1] + x_axis[1] * scale))
                     cv2.arrowedLine(annotated, origin, end_x, (0, 0, 255), 3, tipLength=0.2)
@@ -230,9 +218,9 @@ class Handtracking:
                     if self.calibrated:
                         z = self.f_times_H / hand_size_px
                         cm_per_px = self.get_cm_per_px(z)
-                        x = -cm_per_px * (wrist.x * w - w / 2)
-                        y = -cm_per_px * (wrist.y * h - h / 2)
-                        hand_poses.append((x, y, z, roll, pitch, yaw))
+                        x = -cm_per_px * (wrist[0] * w - w / 2)
+                        y = -cm_per_px * (wrist[1] * h - h / 2)
+                        hand_poses.append((x, y, z, quat[3], quat[0], quat[1], quat[2]))  # (x, y, z, Qw, Qx, Qy, Qz)
 
             if hand_poses:
                 # Separate left and right hands based on x position
@@ -245,27 +233,36 @@ class Handtracking:
                         left_hand = hand_poses[1]
                         right_hand = hand_poses[0]
 
+                    # # Calulate the distance between the two hands in cm
+                    # hand_distance_cm = np.linalg.norm(np.array(left_hand[:3]) - np.array(right_hand[:3]))
+                    # if (hand_distance_cm < 5.0):
+                    #     print(f"Warning: Hands are very close ({hand_distance_cm:.2f} cm), removing right hand.")
+                    #     right_hand = None
+
+                # Convert quaternion to RPY for debugging
+                left_rpy = R.from_quat([left_hand[4], left_hand[5], left_hand[6], left_hand[3]]).as_euler('xyz', degrees=True)
+                right_rpy = R.from_quat([right_hand[4], right_hand[5], right_hand[6], right_hand[3]]).as_euler('xyz', degrees=True) if right_hand is not None else None
+
                 # Print hand poses
                 output = ""
-                if (left_hand is not None):
-                    output = f"Left Hand: x={left_hand[0]:.2f} y={left_hand[1]:.2f} z={left_hand[2]:.2f} R={left_hand[3]:.1f} P={left_hand[4]:.1f} Y={left_hand[5]:.1f}\t\t|\t\t"
-                if (right_hand is not None):
-                    output += f"Right Hand: x={right_hand[0]:.2f} y={right_hand[1]:.2f} z={right_hand[2]:.2f} R={right_hand[3]:.1f} P={right_hand[4]:.1f} Y={right_hand[5]:.1f}"
+                if left_hand is not None:
+                    output = f"Left Hand:\n\tx={left_hand[0]:.2f} y={left_hand[1]:.2f} z={left_hand[2]:.2f}"
+                    output += f"\n\tQw={left_hand[3]:.2f} Qx={left_hand[4]:.2f} Qy={left_hand[5]:.2f} Qz={left_hand[6]:.2f}"
+                    output += f"\n\tR={left_rpy[0]:.1f} P={left_rpy[1]:.1f} Y={left_rpy[2]:.1f}\n"
+                if right_hand is not None:
+                    output += f"Right Hand:\n\tx={right_hand[0]:.2f} y={right_hand[1]:.2f} z={right_hand[2]:.2f}"
+                    output += f"\n\tQw={right_hand[3]:.2f} Qx={right_hand[4]:.2f} Qy={right_hand[5]:.2f} Qz={right_hand[6]:.2f}"
+                    output += f"\n\tR={right_rpy[0]:.1f} P={right_rpy[1]:.1f} Y={right_rpy[2]:.1f}\n"
                 print(output)
 
                 if self.callback_number > 0:
                     print(f"Sending callback number: {self.callback_number}")
 
-                # Convert from rpy to quaternion
-                quat_left = self.rpy_to_quat(left_hand[3], left_hand[4], left_hand[5])
-                quat_right = (0.0, 0.0, 0.0, 1.0)
-                if right_hand is not None:
-                    quat_right = self.rpy_to_quat(right_hand[3], right_hand[4], right_hand[5])
-                else:
-                    right_hand = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                if right_hand is None:
+                    right_hand = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)  # default pose for missing hand
 
                 # Send UDP packet with pose data as JSON
-                pose_data = left_hand[0:3] + quat_left + right_hand[0:3] + quat_right + (float(self.callback_number),)
+                pose_data = left_hand + right_hand + (float(self.callback_number),)
                 msg = np.array(pose_data, dtype=np.float32).tobytes()
                 self.sock.sendto(msg, (self.udp_ip, self.udp_port))
                 self.callback_number = 0  # reset after sending
