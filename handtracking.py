@@ -28,8 +28,8 @@ class Handtracking:
 
     def __init__(self, udp_ip='127.0.0.1', udp_port=5005):
         self.hand_height_cm = 17.0  # measured real hand size cm (wrist to middle tip)
-        self.ref_dist_1 = 15.0      # cm
-        self.ref_dist_2 = 20.0      # cm
+        self.ref_dist_1 = 20.0      # cm
+        self.ref_dist_2 = 50.0      # cm
         self.ref_size_1 = None
         self.ref_size_2 = None
         self.ref_rot_mat = None
@@ -59,7 +59,9 @@ class Handtracking:
         self.prev_hand_poses = []
         self.wrist_axes = []
         self.prev_wrist_axes = []
-        self.palm_sizes = []
+        self.palm_sizes_1 = None
+        self.palm_sizes_2 = None
+        self.f_times_H_edges = None
 
         # Smoothing (moving average)
         self.smoothing_window = 10
@@ -113,12 +115,23 @@ class Handtracking:
 
 
     def _smooth_pose(self, pose_history: deque) -> tuple:
-        arr = np.array(pose_history, dtype=np.float64)  # (N,7)
+        arr = np.array(pose_history, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[1] < 7:
+            return tuple(pose_history[-1])
+
         pos_mean = np.mean(arr[:, 0:3], axis=0)
         quat_mean = self._average_quaternions_wxyz(arr[:, 3:7])
+
+        # Preserve and smooth finger values
+        extras = ()
+        if arr.shape[1] > 7:
+            extras_mean = np.mean(arr[:, 7:], axis=0)
+            extras = tuple(float(x) for x in extras_mean.tolist())
+
         return (
             float(pos_mean[0]), float(pos_mean[1]), float(pos_mean[2]),
-            float(quat_mean[0]), float(quat_mean[1]), float(quat_mean[2]), float(quat_mean[3])
+            float(quat_mean[0]), float(quat_mean[1]), float(quat_mean[2]), float(quat_mean[3]),
+            *extras,
         )
 
 
@@ -162,22 +175,55 @@ class Handtracking:
         return c1 + (c2 - c1) * (z_cm - z1) / (z2 - z1)
 
 
-    def calibrate_step1(self, image_landmarks, hand_size_px, rot_mat):
-        self.palm_sizes = []
+    def calibrate_step1(self, im_lm, hand_size_px, rot_mat):
+        if self.image_w is None or self.image_h is None:
+            raise RuntimeError("Image size not set yet; wait for a frame before calibrating.")
+
+        self.palm_sizes_1 = []
         for connection in self.PALM_CONNECTIONS:
-            start = image_landmarks[connection[0]]
-            end = image_landmarks[connection[1]]
-            self.palm_sizes.append(np.linalg.norm(np.array([start.x - end.x, start.y - end.y])))
+            start = im_lm[connection[0]]
+            end = im_lm[connection[1]]
+            dx = (start.x - end.x) * self.image_w
+            dy = (start.y - end.y) * self.image_h
+            self.palm_sizes_1.append(float(np.hypot(dx, dy)))
 
         self.cm_per_px_1 = self.hand_height_cm / hand_size_px
         self.ref_rot_mat = rot_mat
         print("Calibration Step 1 completed")
 
 
-    def calibrate_step2(self, hand_size_px):
+    def calibrate_step2(self, im_lm, hand_size_px):
+        if self.image_w is None or self.image_h is None:
+            raise RuntimeError("Image size not set yet; wait for a frame before calibrating.")
+        if not self.palm_sizes_1:
+            raise RuntimeError("Run calibration step 1 first (press '9').")
+
+        self.palm_sizes_2 = []
+        for connection in self.PALM_CONNECTIONS:
+            start = im_lm[connection[0]]
+            end = im_lm[connection[1]]
+            dx = (start.x - end.x) * self.image_w
+            dy = (start.y - end.y) * self.image_h
+            self.palm_sizes_2.append(float(np.hypot(dx, dy)))
+
+        z1 = float(self.ref_dist_1)
+        z2 = float(self.ref_dist_2)
+        self.f_times_H_edges = [
+            (s1 * z1 + s2 * z2) / 2.0 for s1, s2 in zip(self.palm_sizes_1, self.palm_sizes_2)
+        ]
+
         self.cm_per_px_2 = self.hand_height_cm / hand_size_px
         self.calibrated = True
         print("Calibration Step 2 completed – using world landmarks for orientation")
+
+
+    def map_finger_value(self, val, min_val, max_val):
+        if val < min_val:
+            return 0.0
+        elif val > max_val:
+            return 1.0
+        else:
+            return (val - min_val) / (max_val - min_val)
 
 
     def tracking_loop(self):
@@ -204,55 +250,43 @@ class Handtracking:
             self.hand_data = self.landmarker.detect_for_video(mp_image, frame_timestamp_ms)
             annotated = image.copy()
 
-            primary_image_landmarks = None
+            primary_im_lm = None
             primary_hand_size_px = None
             primary_rot_mat = None
-
-            if len(self.hand_data.hand_landmarks) > 1:
-                # Optional: simple heuristic to remove overlapping hands
-                hand_distance = np.linalg.norm(np.array([
-                    self.hand_data.hand_landmarks[0][0].x - self.hand_data.hand_landmarks[1][0].x,
-                    self.hand_data.hand_landmarks[0][0].y - self.hand_data.hand_landmarks[1][0].y
-                ]))
-                if hand_distance < 0.25:
-                    print(f"Warning: Hands very close ({hand_distance:.3f}), removing second hand.")
-                    self.hand_data.hand_landmarks.pop(1)
-                    if len(self.hand_data.hand_world_landmarks) > 1:
-                        self.hand_data.hand_world_landmarks.pop(1)
             
             if self.hand_data.hand_world_landmarks:
-                for idx, world_landmarks in enumerate(self.hand_data.hand_world_landmarks):
+                for idx, w_lm in enumerate(self.hand_data.hand_world_landmarks):
                     self.image_h, self.image_w, _ = image.shape
 
                     # Draw connections (still using image landmarks for visualization)
-                    image_landmarks = self.hand_data.hand_landmarks[idx]
+                    im_lm = self.hand_data.hand_landmarks[idx]
                     for start_idx, end_idx in self.HAND_CONNECTIONS:
-                        start = image_landmarks[start_idx]
-                        end = image_landmarks[end_idx]
+                        start = im_lm[start_idx]
+                        end = im_lm[end_idx]
                         start_px = (int(start.x * self.image_w), int(start.y * self.image_h))
                         end_px = (int(end.x * self.image_w), int(end.y * self.image_h))
                         cv2.line(annotated, start_px, end_px, self.CONNECTION_COLOR, self.THICKNESS)
 
                     # Draw landmarks (image space for visualization)
-                    for lm in image_landmarks:
+                    for lm in im_lm:
                         px = (int(lm.x * self.image_w), int(lm.y * self.image_h))
                         cv2.circle(annotated, px, self.RADIUS, self.LANDMARK_COLOR, -1)
 
                     # ────────────────────────────────────────────────
                     # Orientation from WORLD landmarks (metric 3D)
                     # ────────────────────────────────────────────────
-                    wrist   = np.array([world_landmarks[0].x,   world_landmarks[0].y,   world_landmarks[0].z])
-                    index_mcp  = np.array([world_landmarks[5].x,  world_landmarks[5].y,  world_landmarks[5].z])
-                    middle_mcp = np.array([world_landmarks[9].x,  world_landmarks[9].y,  world_landmarks[9].z])
-                    pinky_mcp  = np.array([world_landmarks[17].x, world_landmarks[17].y, world_landmarks[17].z])
+                    wrist      = np.array([w_lm[0].x,  w_lm[0].y,  w_lm[0].z])
+                    index_mcp  = np.array([w_lm[5].x,  w_lm[5].y,  w_lm[5].z])
+                    middle_mcp = np.array([w_lm[9].x,  w_lm[9].y,  w_lm[9].z])
+                    pinky_mcp  = np.array([w_lm[17].x, w_lm[17].y, w_lm[17].z])
 
-                    vec_index  = index_mcp  - wrist
-                    vec_pinky  = pinky_mcp  - wrist
                     vec_middle = middle_mcp - wrist
                     vec_pinky_index = index_mcp - pinky_mcp
 
                     # X axis — pointing towards index finger from pinky
                     x_axis = vec_pinky_index / np.linalg.norm(vec_pinky_index)
+                    if idx == 1:
+                        x_axis = -x_axis  # flip for right hand to match robot frame convention
 
                     # Y axis — pointing towards middle finger
                     y_axis = vec_middle / np.linalg.norm(vec_middle)
@@ -264,67 +298,95 @@ class Handtracking:
                     rot_cam = np.column_stack((x_axis, y_axis, z_axis))
                     rot_mat = self.reorient_mat @ rot_cam
 
-                    wrist_px   = np.array([image_landmarks[0].x * self.image_w,   image_landmarks[0].y * self.image_h])
-                    middle_px  = np.array([image_landmarks[9].x * self.image_w,  image_landmarks[9].y * self.image_h])
+                    wrist_px   = np.array([im_lm[0].x * self.image_w,   im_lm[0].y * self.image_h])
+                    middle_px  = np.array([im_lm[9].x * self.image_w,  im_lm[9].y * self.image_h])
                     hand_size_px = np.linalg.norm(wrist_px - middle_px)
 
                     if idx == 0:
-                        primary_image_landmarks = image_landmarks
+                        primary_im_lm = im_lm
                         primary_hand_size_px = hand_size_px
                         primary_rot_mat = rot_mat
 
                     if self.calibrated:
-                        best_palm_size = None
-                        best_idx = None
-                        min_error = float('inf')
-                        for p_idx, ref_size in enumerate(self.palm_sizes):
+                        # Foreshortening-robust depth:
+                        # Compute a depth estimate from each palm edge and take the median.
+                        if not self.palm_sizes_1 or not self.f_times_H_edges:
+                            continue
+
+                        curr_sizes = []
+                        est_z_values = []
+                        for p_idx, _ref_size in enumerate(self.palm_sizes_1):
                             conn = self.PALM_CONNECTIONS[p_idx]
-                            start = image_landmarks[conn[0]]
-                            end   = image_landmarks[conn[1]]
-                            curr_size = np.linalg.norm(np.array([start.x * self.image_w - end.x * self.image_w,
-                                                                 start.y * self.image_h - end.y * self.image_h]))
-                            error = abs(curr_size - ref_size)
-                            if error < min_error:
-                                best_palm_size = curr_size
-                                best_idx = p_idx
-                                min_error = error
+                            start = im_lm[conn[0]]
+                            end = im_lm[conn[1]]
+                            dx = (start.x - end.x) * self.image_w
+                            dy = (start.y - end.y) * self.image_h
+                            curr_size = float(np.hypot(dx, dy))
+                            curr_sizes.append(curr_size)
 
-                        if best_idx is not None:
-                            # Average focal-length × real-size estimate
-                            f_times_H = (self.palm_sizes[best_idx] * self.ref_dist_1 + best_palm_size * self.ref_dist_2) / 2
-                            est_z = f_times_H / best_palm_size   # pseudo-depth
+                            if curr_size > 1e-6:
+                                est_z_values.append(self.f_times_H_edges[p_idx] / curr_size)
 
-                            cm_per_px = self.get_cm_per_px(est_z)
+                        if not est_z_values:
+                            continue
 
-                            if cm_per_px is not None:
-                                x_cm = -cm_per_px * (wrist_px[0] - self.image_w / 2)
-                                y_cm = -cm_per_px * (wrist_px[1] - self.image_h / 2)
-                                z_cm = est_z
-                            else:
-                                x_cm = y_cm = z_cm = 0.0
+                        # Get the minimum estimated depth from the palm edges and its index (for visualization)
+                        est_z = min(est_z_values)  # pseudo-depth (cm)
+                        best_idx = np.argmin(est_z_values)
 
-                            rel_rot_mat = rot_mat @ self.ref_rot_mat.T
-                            rel_rot_mat = self.robot_frame_change_basis @ rel_rot_mat @ self.robot_frame_change_basis.T
-                            rel_rot_mat = self.robot_frame_rotation @ rel_rot_mat
+                        cm_per_px = self.get_cm_per_px(est_z)
 
-                            quat = R.from_matrix(rel_rot_mat).as_quat()  # [x, y, z, w]
+                        if idx == 0:
+                            x_cm = -cm_per_px * (wrist_px[0] - 0.35 * self.image_w)
+                        else:
+                            x_cm = -cm_per_px * (wrist_px[0] - 0.65 * self.image_w)
+                        y_cm = -cm_per_px * (wrist_px[1] - self.image_h / 2)
+                        z_cm = est_z
 
-                            qw, qx, qy, qz = quat[3], quat[0], quat[1], quat[2]
+                        # Convert position from camera frame to robot base frame in meters
+                        # (x_R = -z_C, y_R = -x_C, z_R = +y_C)
+                        robot_pos = np.array([-x_cm / 100, (self.ref_dist_2 - z_cm) / 100, y_cm / 100])
 
-                            self.hand_poses.append((x_cm, y_cm, z_cm, qw, qx, qy, qz))
+                        if idx == 0:
+                            robot_pos += np.array([-0.15, 0.2, 0.85])
+                        else:
+                            robot_pos += np.array([0.15, 0.2, 0.85])
 
-                            # Visualize selected palm edge
-                            conn = self.PALM_CONNECTIONS[best_idx]
-                            start = image_landmarks[conn[0]]
-                            end   = image_landmarks[conn[1]]
-                            cv2.line(annotated,
-                                     (int(start.x * self.image_w), int(start.y * self.image_h)),
-                                     (int(end.x * self.image_w),   int(end.y * self.image_h)),
-                                     (0, 1, 0), 2 * self.THICKNESS)
+                        rel_rot_mat = rot_mat @ self.ref_rot_mat.T
+                        rel_rot_mat = self.robot_frame_change_basis @ rel_rot_mat @ self.robot_frame_change_basis.T
+                        rel_rot_mat = self.robot_frame_rotation @ rel_rot_mat
 
-                            # Cache axes for drawing after stability/jump check
-                            origin = (int(image_landmarks[0].x * self.image_w), int(image_landmarks[0].y * self.image_h))
-                            self.wrist_axes.append((origin, x_axis, y_axis, z_axis))
+                        quat = R.from_matrix(rel_rot_mat).as_quat()  # [x, y, z, w]
+                        qw, qx, qy, qz = quat[3], quat[0], quat[1], quat[2]
+
+                        # Calculate midpoint of wrist, middle_mcp, and pinky_mcp
+                        palm_center = (wrist + middle_mcp + pinky_mcp) / 3.0
+                        thumb_tip = np.array([w_lm[4].x, w_lm[4].y, w_lm[4].z])
+                        index_tip = np.array([w_lm[8].x, w_lm[8].y, w_lm[8].z])
+                        pinky_tip = np.array([w_lm[20].x, w_lm[20].y, w_lm[20].z])
+                        # Calculate distance of each fingertip to the palm center
+                        thumb_dist = np.linalg.norm(thumb_tip - palm_center)
+                        index_dist = np.linalg.norm(index_tip - palm_center)
+                        pinky_dist = np.linalg.norm(pinky_tip - palm_center)
+
+                        finger_values = [self.map_finger_value(index_dist, 0.05, 0.12),
+                                         self.map_finger_value(pinky_dist, 0.025, 0.09),
+                                         self.map_finger_value(thumb_dist, 0.05, 0.1)]
+
+                        self.hand_poses.append((robot_pos[0], robot_pos[1], robot_pos[2], qw, qx, qy, qz, finger_values[0], finger_values[1], finger_values[2]))
+
+                        # Visualize selected palm edge
+                        conn = self.PALM_CONNECTIONS[best_idx]
+                        start = im_lm[conn[0]]
+                        end   = im_lm[conn[1]]
+                        cv2.line(annotated,
+                                    (int(start.x * self.image_w), int(start.y * self.image_h)),
+                                    (int(end.x * self.image_w),   int(end.y * self.image_h)),
+                                    (0, 1, 0), 2 * self.THICKNESS)
+
+                        # Cache axes for drawing after stability/jump check
+                        origin = (int(im_lm[0].x * self.image_w), int(im_lm[0].y * self.image_h))
+                        self.wrist_axes.append((origin, x_axis, y_axis, z_axis))
 
             if self.hand_poses:
                 # Left/right hand separation logic (based on x in image space)
@@ -372,11 +434,13 @@ class Handtracking:
 
                 # Logging print
                 for idx, hand in enumerate(self.hand_poses):
+                    print(len(hand))
                     hand_rpy = R.from_quat([hand[4], hand[5], hand[6], hand[3]]).as_euler('xyz', degrees=True)
                     output = "Left Hand:" if idx == 0 else "Right Hand:"
                     output += f"\n\tx={hand[0]:.2f} y={hand[1]:.2f} z={hand[2]:.2f}"
                     output += f"\n\tQw={hand[3]:.2f} Qx={hand[4]:.2f} Qy={hand[5]:.2f} Qz={hand[6]:.2f}"
                     output += f"\n\tR={hand_rpy[0]:.1f} P={hand_rpy[1]:.1f} Y={hand_rpy[2]:.1f}\n"
+                    output += f"\tThumb={hand[7]:.3f} Index={hand[8]:.3f} Pinky={hand[9]:.3f}"
                     print(output)
 
                 if self.callback_number > 0:
@@ -384,7 +448,7 @@ class Handtracking:
 
                 # Send UDP message with hand pose data + callback number
                 left_hand = self.hand_poses[0]
-                right_hand = self.hand_poses[1] if len(self.hand_poses) > 1 else (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+                right_hand = self.hand_poses[1] if len(self.hand_poses) > 1 else (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
                 pose_data = left_hand + right_hand + (float(self.callback_number),)
 
                 msg = np.array(pose_data, dtype=np.float32).tobytes()
@@ -399,10 +463,10 @@ class Handtracking:
             elif key == ord('-') or key == ord('_'):
                 self.mirror = not self.mirror
                 print(f"Mirror: {'ON' if self.mirror else 'OFF'}")
-            elif key == ord('9') and primary_image_landmarks is not None:
-                self.calibrate_step1(primary_image_landmarks, primary_hand_size_px, primary_rot_mat)
-            elif key == ord('0') and primary_hand_size_px is not None:
-                self.calibrate_step2(primary_hand_size_px)
+            elif key == ord('9') and primary_im_lm is not None:
+                self.calibrate_step1(primary_im_lm, primary_hand_size_px, primary_rot_mat)
+            elif key == ord('0') and primary_im_lm is not None and primary_hand_size_px is not None:
+                self.calibrate_step2(primary_im_lm, primary_hand_size_px)
             elif key == ord('1'):
                 self.callback_number = 1
             elif key == ord('2'):
