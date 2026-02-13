@@ -64,7 +64,7 @@ class Handtracking:
         self.f_times_H_edges = None
 
         # Smoothing (moving average)
-        self.smoothing_window = 10
+        self.smoothing_window = 20
         # Histories are indexed after left/right ordering (0=left, 1=right)
         self.pose_histories = [deque(maxlen=self.smoothing_window) for _ in range(2)]
         self.axis_histories = [deque(maxlen=self.smoothing_window) for _ in range(2)]
@@ -93,11 +93,17 @@ class Handtracking:
         self.active_gesture = None  # None | 'start' | 'end'
         self.gesture_step = 0
         self.override_gesture = False
+        self.episode_started = False
 
         self.robot_left_offset = np.array([-0.15, 0.2, 0.85])
         self.robot_right_offset = np.array([0.15, 0.2, 0.85])
         self.start_left_offset = np.zeros(3)
         self.start_right_offset = np.zeros(3)
+
+
+    @staticmethod
+    def _with_xyz(pose: tuple, xyz: np.ndarray) -> tuple:
+        return (float(xyz[0]), float(xyz[1]), float(xyz[2]), *pose[3:])
 
 
     @staticmethod
@@ -253,15 +259,11 @@ class Handtracking:
             target_quat_right: tuple = (-0.55, -0.49, 0.56, -0.37)) -> bool:
         '''
         Left Hand:
-                x=-0.17 y=0.32 z=0.58
-                Qw=0.36 Qx=0.76 Qy=-0.29 Qz=0.46
-                R=139.1 P=-64.7 Y=-14.6
-                Thumb=0.708 Index=0.623 Pinky=1.000
+                x=-0.16 y=0.39 z=1.11
+                Qw=0.44 Qx=0.75 Qy=-0.21 Qz=0.44        Thumb=1.000 Index=0.971 Pinky=1.000
         Right Hand:
-                x=0.14 y=0.29 z=0.62
-                Qw=-0.55 Qx=-0.49 Qy=0.56 Qz=-0.37
-                R=134.4 P=-80.5 Y=-59.0
-                Thumb=0.580 Index=0.611 Pinky=1.000
+                x=0.00 y=0.33 z=0.99
+                Qw=-0.46 Qx=-0.50 Qy=0.61 Qz=-0.41      Thumb=1.000 Index=0.840 Pinky=1.000
         '''
         if not self.hand_poses or len(self.hand_poses) < 2:
             return False
@@ -279,18 +281,17 @@ class Handtracking:
         # print(f"\tX error: {abs(avg_x - target_x):.2f}, Z: {avg_z:.2f} < {max_z}")
         # print(f"\tLeft quat dist: {self._quaternion_distance(quat_left, target_quat_left):.2f}, Right quat dist: {self._quaternion_distance(quat_right, target_quat_right):.2f}")
 
-        return (abs(avg_x - target_x) < 0.1 and
-                abs(dist_x - target_x_dist) < 0.1 and
-                avg_z < max_z and
-                self._quaternion_distance(quat_left, target_quat_left) < 0.7 and
-                self._quaternion_distance(quat_right, target_quat_right) < 0.7)
+        return (abs(avg_x - target_x) < 0.2 and
+                abs(dist_x - target_x_dist) < 0.2 and
+                self._quaternion_distance(quat_left, target_quat_left) < 1.5 and
+                self._quaternion_distance(quat_right, target_quat_right) < 1.5)
 
 
     def check_end_gesture(
             self,
             target_x: float = 0.0,
             min_x_dist: float = 0.7,
-            min_z: float = 0.7,
+            min_z: float = 1.2,
             target_quat_left: tuple = (-0.12, 0.99, -0.10, 0.00),
             target_quat_right: tuple = (0.06, -0.26, 0.96, 0.01)) -> bool:
         '''
@@ -341,6 +342,7 @@ class Handtracking:
 
             self.hand_poses = []
             self.wrist_axes = []
+            raw_robot_positions = []  # per detected hand, before applying any offsets
 
             if self.mirror:
                 image = cv2.flip(image, 1)
@@ -446,12 +448,28 @@ class Handtracking:
 
                         # Convert position from camera frame to robot base frame in meters
                         # (x_R = -z_C, y_R = -x_C, z_R = +y_C)
-                        robot_pos = np.array([-x_cm / 100, (self.ref_dist_2 - z_cm) / 100, y_cm / 100])
+                        x_scaling = 2.0
+                        y_scaling = 2.0
+                        z_scaling = 2.0
+                        robot_pos = np.array([x_scaling * (-x_cm / 100), y_scaling * (self.ref_dist_2 - z_cm) / 100, z_scaling * (y_cm / 100)])
+
+                        # Keep a copy in a consistent "raw" frame (no artificial offsets)
+                        robot_pos_raw = robot_pos.copy()
 
                         if idx == 0:
-                            robot_pos += self.robot_left_offset - self.start_left_offset
+                            if np.linalg.norm(self.start_left_offset) > 1e-6:
+                                applied = self.robot_left_offset - self.start_left_offset
+                                print(f"Applying left hand offset: {applied}")
+                                robot_pos = robot_pos_raw - self.start_left_offset + self.robot_left_offset
+                            else:
+                                robot_pos = robot_pos_raw + self.robot_left_offset
                         else:
-                            robot_pos += self.robot_right_offset - self.start_right_offset
+                            if np.linalg.norm(self.start_right_offset) > 1e-6:
+                                applied = self.robot_right_offset - self.start_right_offset
+                                print(f"Applying right hand offset: {applied}")
+                                robot_pos = robot_pos_raw - self.start_right_offset + self.robot_right_offset
+                            else:
+                                robot_pos = robot_pos_raw + self.robot_right_offset
 
                         rel_rot_mat = rot_mat @ self.ref_rot_mat.T
                         rel_rot_mat = self.robot_frame_change_basis @ rel_rot_mat @ self.robot_frame_change_basis.T
@@ -465,15 +483,19 @@ class Handtracking:
                         index_tip = np.array([w_lm[8].x, w_lm[8].y, w_lm[8].z])
                         pinky_tip = np.array([w_lm[20].x, w_lm[20].y, w_lm[20].z])
                         # Calculate distance of each fingertip to the palm center
-                        thumb_dist = np.linalg.norm(thumb_tip - palm_center)
-                        index_dist = np.linalg.norm(index_tip - palm_center)
-                        pinky_dist = np.linalg.norm(pinky_tip - palm_center)
+                        wrist_palm_dist = np.linalg.norm(palm_center - wrist)
+                        thumb_dist = np.linalg.norm(thumb_tip - palm_center) / wrist_palm_dist
+                        index_dist = np.linalg.norm(index_tip - palm_center) / wrist_palm_dist
+                        pinky_dist = np.linalg.norm(pinky_tip - palm_center) / wrist_palm_dist
 
-                        finger_values = [self.map_finger_value(index_dist, 0.05, 0.12),
-                                         self.map_finger_value(pinky_dist, 0.025, 0.09),
-                                         self.map_finger_value(thumb_dist, 0.05, 0.1)]
+                        # print(f"Hand {idx}: Wrist-Palm Dist={wrist_palm_dist:.3f}, Thumb={thumb_dist:.3f}, Index={index_dist:.3f}, Pinky={pinky_dist:.3f}")
+
+                        finger_values = [self.map_finger_value(index_dist, 0.9, 1.9),
+                                         self.map_finger_value(pinky_dist, 0.9, 1.5),
+                                         self.map_finger_value(thumb_dist, 0.8, 1.6)]
 
                         self.hand_poses.append((robot_pos[0], robot_pos[1], robot_pos[2], qw, qx, qy, qz, finger_values[0], finger_values[1], finger_values[2]))
+                        raw_robot_positions.append(robot_pos_raw)
 
                         # Visualize selected palm edge
                         conn = self.PALM_CONNECTIONS[best_idx]
@@ -496,6 +518,11 @@ class Handtracking:
                         tmp = self.hand_poses[0]
                         self.hand_poses[0] = self.hand_poses[1]
                         self.hand_poses[1] = tmp
+
+                        if len(raw_robot_positions) > 1:
+                            tmp_raw = raw_robot_positions[0]
+                            raw_robot_positions[0] = raw_robot_positions[1]
+                            raw_robot_positions[1] = tmp_raw
 
                         # Keep axes aligned with hand_poses
                         if len(self.wrist_axes) > 1:
@@ -534,14 +561,28 @@ class Handtracking:
                         self.gesture_step = 0
 
                     # Emit: 1 -> 0 (once per sustained detection)
-                    if self.gesture_step == 0:
-                        self.callback_number = 1
-                        self.gesture_step = 1
-                        # Set the starting hand offsets
-                        self.start_left_offset = np.array([left_hand[0], left_hand[1], left_hand[2]]) - self.robot_left_offset
-                        self.start_right_offset = np.array([right_hand[0], right_hand[1], right_hand[2]]) - self.robot_right_offset
-                    else:
-                        self.callback_number = 0
+                    if not self.episode_started:
+                        if self.gesture_step == 0:
+                            self.callback_number = 1
+                            self.gesture_step = 1
+                            # Set the starting hand offsets in RAW space (pre-offset robot_pos).
+                            # This avoids mixing smoothed/offset poses with raw landmark-derived positions.
+                            if len(raw_robot_positions) >= 2:
+                                self.start_left_offset = raw_robot_positions[0]
+                                self.start_right_offset = raw_robot_positions[1]
+                            print(f"Start gesture detected. Left offset: {self.start_left_offset}, Right offset: {self.start_right_offset}")
+
+                            # Reset smoothing so we don't average pre-START poses into the new rebased frame.
+                            for h in self.pose_histories:
+                                h.clear()
+                            for h in self.axis_histories:
+                                h.clear()
+                            if len(self.hand_poses) >= 2:
+                                self.pose_histories[0].append(self._with_xyz(self.hand_poses[0], self.robot_left_offset))
+                                self.pose_histories[1].append(self._with_xyz(self.hand_poses[1], self.robot_right_offset))
+                        else:
+                            self.callback_number = 0
+                            self.episode_started = True
                 elif end_active:
                     # Keep END text visible while gesture persists.
                     cv2.putText(annotated, 'END', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3, cv2.LINE_AA)
@@ -550,17 +591,19 @@ class Handtracking:
                         self.gesture_step = 0
 
                     # Emit: 2 -> 3 -> 0 (once per sustained detection)
-                    if self.gesture_step == 0:
-                        self.callback_number = 2
-                        self.gesture_step = 1
-                        # Reset the starting hand offsets to zero
-                        self.start_left_offset = np.zeros(3)
-                        self.start_right_offset = np.zeros(3)
-                    elif self.gesture_step == 1:
-                        self.callback_number = 3
-                        self.gesture_step = 2
-                    else:
-                        self.callback_number = 0
+                    if self.episode_started:
+                        if self.gesture_step == 0:
+                            self.callback_number = 2
+                            self.gesture_step = 1
+                            # Reset the starting hand offsets to zero
+                            self.start_left_offset = np.zeros(3)
+                            self.start_right_offset = np.zeros(3)
+                        elif self.gesture_step == 1:
+                            self.callback_number = 3
+                            self.gesture_step = 2
+                        else:
+                            self.callback_number = 0
+                            self.episode_started = False
                 else:
                     # No gesture detected; reset latch so the next detection replays the sequence.
                     if not self.override_gesture:
@@ -585,7 +628,7 @@ class Handtracking:
                     output = "Left Hand:" if idx == 0 else "Right Hand:"
                     output += f"\n\tx={hand[0]:.2f} y={hand[1]:.2f} z={hand[2]:.2f}"
                     output += f"\n\tQw={hand[3]:.2f} Qx={hand[4]:.2f} Qy={hand[5]:.2f} Qz={hand[6]:.2f}"
-                    output += f"\n\tR={hand_rpy[0]:.1f} P={hand_rpy[1]:.1f} Y={hand_rpy[2]:.1f}\n"
+                    # output += f"\n\tR={hand_rpy[0]:.1f} P={hand_rpy[1]:.1f} Y={hand_rpy[2]:.1f}\n"
                     output += f"\tThumb={hand[7]:.3f} Index={hand[8]:.3f} Pinky={hand[9]:.3f}"
                     print(output)
 
@@ -595,10 +638,18 @@ class Handtracking:
                 # Send UDP message with hand pose data + callback number
                 left_hand = self.hand_poses[0]
                 right_hand = self.hand_poses[1] if len(self.hand_poses) > 1 else (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+
+                # On the START frame, force the reported xyz to equal the IsaacSim offsets exactly.
+                # Orientation/fingers remain whatever is currently computed.
+                if self.active_gesture == 'start' and self.callback_number == 1 and len(self.hand_poses) >= 2:
+                    left_hand = self._with_xyz(left_hand, self.robot_left_offset)
+                    right_hand = self._with_xyz(right_hand, self.robot_right_offset)
                 pose_data = left_hand + right_hand + (float(self.callback_number),)
 
                 msg = np.array(pose_data, dtype=np.float32).tobytes()
                 self.sock.sendto(msg, (self.udp_ip, self.udp_port))
+
+                self.callback_number = 0
 
             cv2.imshow('Hand Landmarker (World + Manual Draw)', annotated)
 
