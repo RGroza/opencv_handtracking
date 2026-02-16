@@ -3,13 +3,38 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import numpy as np
-import json
 import argparse
 from scipy.spatial.transform import Rotation as R
 from collections import deque
+from dataclasses import dataclass
+from typing import Optional, Tuple
+import socket
 
 
-class Handtracking:
+@dataclass
+class HandData:
+    """Per-hand state container updated every frame."""
+
+    side: str  # 'left' | 'right'
+    detected: bool = False
+
+    # Smoothed pose tuple in CAMERA-NORMALIZED coordinates:
+    # (x_n, y_n, z_n, qw, qx, qy, qz, index, pinky, thumb)
+    # where x_n,y_n are the MediaPipe image landmark coords in [0,1]
+    # and z_n is normalized depth (not clipped) with:
+    #   z_n=0  -> distance at _calibrate_step_1 (ref_dist_1)
+    #   z_n=1  -> distance at _calibrate_step_2 (ref_dist_2)
+    # Values <0 or >1 mean extrapolation outside the calibration range.
+    pose: Optional[tuple] = None
+
+    # Raw (pre-smoothing) camera-normalized position (x_n, y_n, z_n) for this frame.
+    raw_cam_pos: Optional[np.ndarray] = None
+
+    # Smoothed axes in image space: (origin_px, x_axis, y_axis, z_axis)
+    axes: Optional[Tuple[Tuple[int, int], np.ndarray, np.ndarray, np.ndarray]] = None
+
+
+class HandTracking:
     MODEL_PATH = "hand_landmarker.task"
     HAND_CONNECTIONS = [
         (0, 1), (1, 2), (2, 3), (3, 4),
@@ -26,21 +51,24 @@ class Handtracking:
     THICKNESS = 2
     RADIUS = 4
 
+
     def __init__(self, udp_ip='127.0.0.1', udp_port=5005):
-        self.hand_height_cm = 17.0  # measured real hand size cm (wrist to middle tip)
-        self.ref_dist_1 = 20.0      # cm
-        self.ref_dist_2 = 50.0      # cm
-        self.ref_size_1 = None
-        self.ref_size_2 = None
-        self.ref_rot_mat = None
-        self.cm_per_px_1 = None
-        self.cm_per_px_2 = None
-        self.f_times_H = None
-        self.calibrated = False
-        self.callback_number = 0
         self.mirror = True
         self.image_w = None
         self.image_h = None
+
+        self.hand_height_cm = 17.0  # measured real hand size cm (wrist to middle tip)
+        self.ref_dist_1 = 20.0      # cm
+        self.ref_dist_2 = 50.0      # cm
+        self.cm_per_px_1 = None
+        self.cm_per_px_2 = None
+        self.palm_sizes_1 = None
+        self.palm_sizes_2 = None
+        self.f_times_H_edges = None
+        self.ref_rot_mat = None
+
+        self.calibrated = False
+        self.callback_number = 0
 
         # Fixed rotation from camera frame (C) to robot base frame (B)
         # Camera is in facing the user while the robot's perspective is from it's head
@@ -50,27 +78,23 @@ class Handtracking:
              [0, 0, -1],
              [0, 1, 0]]
         )
-
         self.robot_frame_rotation = np.diag([1, -1, -1])
         self.robot_frame_change_basis = np.diag([1, 1, -1])
 
-        self.hand_data = None
+        # Persistent per-hand containers (updated every frame)
+        self.left_hand = HandData('left')
+        self.right_hand = HandData('right')
         self.hand_poses = []
-        self.prev_hand_poses = []
         self.wrist_axes = []
-        self.prev_wrist_axes = []
-        self.palm_sizes_1 = None
-        self.palm_sizes_2 = None
-        self.f_times_H_edges = None
+        self.finger_values = []
 
         # Smoothing (moving average)
-        self.smoothing_window = 20
+        self.smoothing_window = 10
         # Histories are indexed after left/right ordering (0=left, 1=right)
         self.pose_histories = [deque(maxlen=self.smoothing_window) for _ in range(2)]
         self.axis_histories = [deque(maxlen=self.smoothing_window) for _ in range(2)]
 
         # UDP setup
-        import socket
         self.udp_ip = udp_ip
         self.udp_port = udp_port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -104,6 +128,44 @@ class Handtracking:
     @staticmethod
     def _with_xyz(pose: tuple, xyz: np.ndarray) -> tuple:
         return (float(xyz[0]), float(xyz[1]), float(xyz[2]), *pose[3:])
+
+
+    def _cam_norm_to_robot_m(
+        self,
+        cam_xyz_n: np.ndarray,
+        side: str,
+        x_scaling: float,
+        y_scaling: float,
+        z_scaling: float,
+    ) -> np.ndarray:
+        """Convert (x_n,y_n,z_n) to robot base frame meters using calibration at the end."""
+        if self.image_w is None or self.image_h is None:
+            return np.zeros(3, dtype=np.float64)
+
+        x_n, y_n, z_n = float(cam_xyz_n[0]), float(cam_xyz_n[1]), float(cam_xyz_n[2])
+        z_cm = float(self.ref_dist_1 + z_n * (self.ref_dist_2 - self.ref_dist_1))
+        cm_per_px = self._cm_per_px(z_cm)
+        if cm_per_px is None:
+            return np.zeros(3, dtype=np.float64)
+
+        wrist_px_x = x_n * float(self.image_w)
+        wrist_px_y = y_n * float(self.image_h)
+
+        # Preserve original left/right anchoring behavior
+        anchor = 0.35 if side == 'left' else 0.65
+        x_cm = -cm_per_px * (wrist_px_x - anchor * float(self.image_w))
+        y_cm = -cm_per_px * (wrist_px_y - float(self.image_h) / 2.0)
+
+        # Convert position from camera frame to robot base frame in meters
+        # (x_R = -z_C, y_R = -x_C, z_R = +y_C)
+        return np.array(
+            [
+                x_scaling * (-x_cm / 100.0),
+                y_scaling * ((self.ref_dist_2 - z_cm) / 100.0),
+                z_scaling * (y_cm / 100.0),
+            ],
+            dtype=np.float64,
+        )
 
 
     @staticmethod
@@ -176,7 +238,7 @@ class Handtracking:
         return (origin, x_axis, y_axis, z_axis)
 
 
-    def get_cm_per_px(self, z_cm):
+    def _cm_per_px(self, z_cm):
         if self.cm_per_px_1 is None or self.cm_per_px_2 is None:
             return None
         z1, z2 = self.ref_dist_1, self.ref_dist_2
@@ -186,7 +248,7 @@ class Handtracking:
         return c1 + (c2 - c1) * (z_cm - z1) / (z2 - z1)
 
 
-    def calibrate_step1(self, im_lm, hand_size_px, rot_mat):
+    def _calibrate_step_1(self, im_lm, hand_size_px, rot_mat):
         if self.image_w is None or self.image_h is None:
             print("Image size not set yet; wait for a frame before calibrating.")
             return
@@ -204,7 +266,7 @@ class Handtracking:
         print("Calibration Step 1 completed")
 
 
-    def calibrate_step2(self, im_lm, hand_size_px):
+    def _calibrate_step_2(self, im_lm, hand_size_px):
         if self.image_w is None or self.image_h is None:
             print("Image size not set yet; wait for a frame before calibrating.")
             return
@@ -231,7 +293,7 @@ class Handtracking:
         print("Calibration Step 2 completed")
 
 
-    def map_finger_value(self, val, min_val, max_val):
+    def _finger_value(self, val, min_val, max_val):
         if val < min_val:
             return 0.0
         elif val > max_val:
@@ -252,118 +314,145 @@ class Handtracking:
 
     def check_start_gesture(
             self,
-            target_x: float = 0.0,
+            target_x: float = 0.5,
             target_x_dist: float = 0.3,
-            max_z: float = 0.8,
-            target_quat_left: tuple = (0.36, 0.76, -0.29, 0.46),
-            target_quat_right: tuple = (-0.55, -0.49, 0.56, -0.37)) -> bool:
+            min_y: float = 0.4,
+            target_quat_left: tuple = (0.47, 0.73, -0.27, 0.41),
+            target_quat_right: tuple = (0.51, 0.56, -0.55, 0.35)) -> bool:
         '''
         Left Hand:
-                x=-0.16 y=0.39 z=1.11
-                Qw=0.44 Qx=0.75 Qy=-0.21 Qz=0.44        Thumb=1.000 Index=0.971 Pinky=1.000
+                x=0.34 y=0.88 z=0.28
+                Qw=0.47 Qx=0.73 Qy=-0.27 Qz=0.41
         Right Hand:
-                x=0.00 y=0.33 z=0.99
-                Qw=-0.46 Qx=-0.50 Qy=0.61 Qz=-0.41      Thumb=1.000 Index=0.840 Pinky=1.000
+                x=0.65 y=0.85 z=0.34
+                Qw=0.51 Qx=0.56 Qy=-0.55 Qz=0.35
         '''
-        if not self.hand_poses or len(self.hand_poses) < 2:
+        if self.left_hand.pose is None or self.right_hand.pose is None:
             return False
         
-        left_hand = self.hand_poses[0]
-        right_hand = self.hand_poses[1]
+        left_hand = self.left_hand.pose
+        right_hand = self.right_hand.pose
 
         avg_x = (left_hand[0] + right_hand[0]) / 2
-        avg_z = (left_hand[2] + right_hand[2]) / 2
+        avg_y = (left_hand[1] + right_hand[1]) / 2
         dist_x = abs(left_hand[0] - right_hand[0])
         quat_left = [left_hand[3], left_hand[4], left_hand[5], left_hand[6]]
         quat_right = [right_hand[3], right_hand[4], right_hand[5], right_hand[6]]
     
         # print("Start Gesture Check")
-        # print(f"\tX error: {abs(avg_x - target_x):.2f}, Z: {avg_z:.2f} < {max_z}")
+        # print(f"\tX error: {abs(avg_x - target_x):.2f}, Y: {avg_y:.2f} > {min_y}")
         # print(f"\tLeft quat dist: {self._quaternion_distance(quat_left, target_quat_left):.2f}, Right quat dist: {self._quaternion_distance(quat_right, target_quat_right):.2f}")
 
         return (abs(avg_x - target_x) < 0.2 and
                 abs(dist_x - target_x_dist) < 0.2 and
+                avg_y > min_y and
                 self._quaternion_distance(quat_left, target_quat_left) < 1.5 and
-                self._quaternion_distance(quat_right, target_quat_right) < 1.5)
+                self._quaternion_distance(quat_right, target_quat_right) < 1.5 and
+                all(fv > 0.5 for fv in self.finger_values))
 
 
-    def check_end_gesture(
+    def check_stop_gesture(
             self,
-            target_x: float = 0.0,
-            min_x_dist: float = 0.7,
-            min_z: float = 1.2,
-            target_quat_left: tuple = (-0.12, 0.99, -0.10, 0.00),
-            target_quat_right: tuple = (0.06, -0.26, 0.96, 0.01)) -> bool:
+            target_x: float = 0.5,
+            min_x_dist: float = 0.6,
+            max_y: float = 0.4,
+            target_quat_left: tuple = (0.0, 1.0, 0.0, 0.0),
+            target_quat_right: tuple = (0.0, 0.0, 1.0, 0.0)) -> bool:
         '''
         Left Hand:
-                x=-0.18 y=0.26 z=0.78
-                Qw=-0.12 Qx=0.99 Qy=-0.10 Qz=0.00
-                R=-166.7 P=0.8 Y=-11.1
-                Thumb=0.956 Index=1.000 Pinky=0.633
+                x=0.14 y=0.45 z=0.78
+                Qw=-0.00 Qx=1.00 Qy=0.01 Qz=-0.02
         Right Hand:
-                x=0.22 y=0.26 z=0.81
-                Qw=0.06 Qx=-0.26 Qy=0.96 Qz=0.01
-                R=-178.8 P=6.8 Y=-150.1
-                Thumb=0.887 Index=1.000 Pinky=0.612
+                x=0.89 y=0.45 z=0.81
+                Qw=0.15 Qx=-0.23 Qy=0.96 Qz=0.03
         '''
-        if not self.hand_poses or len(self.hand_poses) < 2:
+        if self.left_hand.pose is None or self.right_hand.pose is None:
             return False
         
-        left_hand = self.hand_poses[0]
-        right_hand = self.hand_poses[1]
+        left_hand = self.left_hand.pose
+        right_hand = self.right_hand.pose
 
         avg_x = (left_hand[0] + right_hand[0]) / 2
-        avg_z = (left_hand[2] + right_hand[2]) / 2
+        avg_y = (left_hand[1] + right_hand[1]) / 2
         dist_x = abs(left_hand[0] - right_hand[0])
         quat_left = [left_hand[3], left_hand[4], left_hand[5], left_hand[6]]
         quat_right = [right_hand[3], right_hand[4], right_hand[5], right_hand[6]]
 
-        # print("End Gesture Check")
-        # print(f"\tX error: {abs(avg_x - target_x):.2f}, Z: {avg_z:.2f}")
+        # print("Stop Gesture Check")
+        # print(f"\tX error: {abs(avg_x - target_x):.2f}, Y: {avg_y:.2f}")
         # print(f"\tLeft quat dist: {self._quaternion_distance(quat_left, target_quat_left):.2f}, Right quat dist: {self._quaternion_distance(quat_right, target_quat_right):.2f}")
 
         return (abs(avg_x - target_x) < 0.3 and
                 dist_x > min_x_dist and
-                avg_z > min_z and
+                avg_y < max_y and
                 self._quaternion_distance(quat_left, target_quat_left) < 0.7 and
-                self._quaternion_distance(quat_right, target_quat_right) < 0.7)
+                self._quaternion_distance(quat_right, target_quat_right) < 0.7 and
+                all(fv > 0.5 for fv in self.finger_values))
 
 
     def tracking_loop(self):
         cap = cv2.VideoCapture(0)
         frame_timestamp_ms = 0
-        cv2.namedWindow('Hand Landmarker (World + Manual Draw)', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Hand Landmarker (World + Manual Draw)', 1280, 720)
+        window_name = 'Hand Tracking'
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 1280, 720)
+
+        # UI controls: scaling sliders (trackbars)
+        # Store scaling as integer hundredths to support float-like control.
+        def _noop(_val):
+            pass
+
+        scale_mult = 100
+        scale_max = 500  # 0.00 .. 5.00
+        cv2.createTrackbar('Horiz', window_name, int(2.0 * scale_mult), scale_max, _noop)
+        cv2.createTrackbar('Vert', window_name, int(2.0 * scale_mult), scale_max, _noop)
+        cv2.createTrackbar('Depth', window_name, int(2.0 * scale_mult), scale_max, _noop)
 
         while cap.isOpened():
             success, image = cap.read()
             if not success:
                 break
 
-            self.hand_poses = []
-            self.wrist_axes = []
-            raw_robot_positions = []  # per detected hand, before applying any offsets
+            # Per-frame detection list; we will assign them to (left, right)
+            detections = []
 
             if self.mirror:
                 image = cv2.flip(image, 1)
+
+            # Read scaling factors from UI (available regardless of calibration state)
+            x_scaling = cv2.getTrackbarPos('Horiz', window_name) / scale_mult
+            y_scaling = cv2.getTrackbarPos('Vert', window_name) / scale_mult
+            z_scaling = cv2.getTrackbarPos('Depth', window_name) / scale_mult
 
             frame_timestamp_ms += 33  # ~30 FPS
 
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
-            self.hand_data = self.landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+            landmark_data = self.landmarker.detect_for_video(mp_image, frame_timestamp_ms)
             annotated = image.copy()
+
+            # Display current scaling values
+            overlay_lines = [
+                f"Horiz: {x_scaling:.2f}",
+                f"Vert: {y_scaling:.2f}",
+                f"Depth: {z_scaling:.2f}",
+            ]
+            y0 = 30
+            for i, text in enumerate(overlay_lines):
+                org = (10, y0 + i * 25)
+                cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
 
             primary_im_lm = None
             primary_hand_size_px = None
             primary_rot_mat = None
             
-            if self.hand_data.hand_world_landmarks:
-                for idx, w_lm in enumerate(self.hand_data.hand_world_landmarks):
+            if landmark_data.hand_world_landmarks:
+                for idx, w_lm in enumerate(landmark_data.hand_world_landmarks):
                     self.image_h, self.image_w, _ = image.shape
 
                     # Draw connections (still using image landmarks for visualization)
-                    im_lm = self.hand_data.hand_landmarks[idx]
+                    im_lm = landmark_data.hand_landmarks[idx]
                     for start_idx, end_idx in self.HAND_CONNECTIONS:
                         start = im_lm[start_idx]
                         end = im_lm[end_idx]
@@ -437,7 +526,7 @@ class Handtracking:
                         est_z = min(est_z_values)  # pseudo-depth (cm)
                         best_idx = np.argmin(est_z_values)
 
-                        cm_per_px = self.get_cm_per_px(est_z)
+                        cm_per_px = self._cm_per_px(est_z)
 
                         if idx == 0:
                             x_cm = -cm_per_px * (wrist_px[0] - 0.35 * self.image_w)
@@ -446,30 +535,12 @@ class Handtracking:
                         y_cm = -cm_per_px * (wrist_px[1] - self.image_h / 2)
                         z_cm = est_z
 
-                        # Convert position from camera frame to robot base frame in meters
-                        # (x_R = -z_C, y_R = -x_C, z_R = +y_C)
-                        x_scaling = 2.0
-                        y_scaling = 2.0
-                        z_scaling = 2.0
-                        robot_pos = np.array([x_scaling * (-x_cm / 100), y_scaling * (self.ref_dist_2 - z_cm) / 100, z_scaling * (y_cm / 100)])
-
-                        # Keep a copy in a consistent "raw" frame (no artificial offsets)
-                        robot_pos_raw = robot_pos.copy()
-
-                        if idx == 0:
-                            if np.linalg.norm(self.start_left_offset) > 1e-6:
-                                applied = self.robot_left_offset - self.start_left_offset
-                                print(f"Applying left hand offset: {applied}")
-                                robot_pos = robot_pos_raw - self.start_left_offset + self.robot_left_offset
-                            else:
-                                robot_pos = robot_pos_raw + self.robot_left_offset
-                        else:
-                            if np.linalg.norm(self.start_right_offset) > 1e-6:
-                                applied = self.robot_right_offset - self.start_right_offset
-                                print(f"Applying right hand offset: {applied}")
-                                robot_pos = robot_pos_raw - self.start_right_offset + self.robot_right_offset
-                            else:
-                                robot_pos = robot_pos_raw + self.robot_right_offset
+                        # Camera-normalized pose for smoothing + gesture detection
+                        x_n = float(im_lm[0].x)
+                        y_n = float(im_lm[0].y)
+                        denom = float(self.ref_dist_2 - self.ref_dist_1)
+                        z_n = 0.0 if abs(denom) < 1e-9 else float((z_cm - self.ref_dist_1) / denom)
+                        cam_pos_n = np.array([x_n, y_n, z_n], dtype=np.float64)
 
                         rel_rot_mat = rot_mat @ self.ref_rot_mat.T
                         rel_rot_mat = self.robot_frame_change_basis @ rel_rot_mat @ self.robot_frame_change_basis.T
@@ -490,12 +561,11 @@ class Handtracking:
 
                         # print(f"Hand {idx}: Wrist-Palm Dist={wrist_palm_dist:.3f}, Thumb={thumb_dist:.3f}, Index={index_dist:.3f}, Pinky={pinky_dist:.3f}")
 
-                        finger_values = [self.map_finger_value(index_dist, 0.9, 1.9),
-                                         self.map_finger_value(pinky_dist, 0.9, 1.5),
-                                         self.map_finger_value(thumb_dist, 0.8, 1.6)]
+                        self.finger_values = [self._finger_value(index_dist, 0.9, 1.9),
+                                              self._finger_value(pinky_dist, 0.9, 1.5),
+                                              self._finger_value(thumb_dist, 0.8, 1.6)]
 
-                        self.hand_poses.append((robot_pos[0], robot_pos[1], robot_pos[2], qw, qx, qy, qz, finger_values[0], finger_values[1], finger_values[2]))
-                        raw_robot_positions.append(robot_pos_raw)
+                        pose = (cam_pos_n[0], cam_pos_n[1], cam_pos_n[2], qw, qx, qy, qz, self.finger_values[0], self.finger_values[1], self.finger_values[2])
 
                         # Visualize selected palm edge
                         conn = self.PALM_CONNECTIONS[best_idx]
@@ -508,50 +578,57 @@ class Handtracking:
 
                         # Cache axes for drawing after stability/jump check
                         origin = (int(im_lm[0].x * self.image_w), int(im_lm[0].y * self.image_h))
-                        self.wrist_axes.append((origin, x_axis, y_axis, z_axis))
 
-            if self.hand_poses:
-                # Left/right hand separation logic (based on x in image space)
-                if len(self.hand_poses) > 1:
-                    if self.hand_poses[0][0] > self.hand_poses[1][0]:
-                        # Swap hand poses in the list
-                        tmp = self.hand_poses[0]
-                        self.hand_poses[0] = self.hand_poses[1]
-                        self.hand_poses[1] = tmp
+                        detections.append({
+                            'pose': pose,
+                            'raw_cam_pos': cam_pos_n,
+                            'axes': (origin, x_axis, y_axis, z_axis),
+                            'order_x': origin[0],
+                        })
 
-                        if len(raw_robot_positions) > 1:
-                            tmp_raw = raw_robot_positions[0]
-                            raw_robot_positions[0] = raw_robot_positions[1]
-                            raw_robot_positions[1] = tmp_raw
+            # Assign detections to (left, right) ordering using image-space x
+            assigned = []
+            if len(detections) >= 2:
+                assigned = sorted(detections, key=lambda d: d['order_x'])[:2]
+            elif len(detections) == 1:
+                assigned = [detections[0]]
 
-                        # Keep axes aligned with hand_poses
-                        if len(self.wrist_axes) > 1:
-                            tmp_axes = self.wrist_axes[0]
-                            self.wrist_axes[0] = self.wrist_axes[1]
-                            self.wrist_axes[1] = tmp_axes
+            # Moving-average smoothing over last N frames (per hand index)
+            hands = [self.left_hand, self.right_hand]
+            for i in range(2):
+                if i < len(assigned):
+                    pose = assigned[i]['pose']
+                    axes = assigned[i]['axes']
+                    raw_pos = assigned[i]['raw_cam_pos']
 
-                # Moving-average smoothing over last N frames (per hand index)
-                for i in range(2):
-                    if i < len(self.hand_poses):
-                        self.pose_histories[i].append(self.hand_poses[i])
-                        if i < len(self.wrist_axes):
-                            self.axis_histories[i].append(self.wrist_axes[i])
-                    else:
-                        self.pose_histories[i].clear()
-                        self.axis_histories[i].clear()
+                    self.pose_histories[i].append(pose)
+                    self.axis_histories[i].append(axes)
 
-                smoothed_poses = []
-                smoothed_axes = []
-                for i in range(len(self.hand_poses)):
-                    smoothed_poses.append(self._smooth_pose(self.pose_histories[i]))
-                    smoothed_axes.append(self._smooth_axes(self.axis_histories[i]))
+                    hands[i].detected = True
+                    hands[i].raw_cam_pos = raw_pos
+                else:
+                    self.pose_histories[i].clear()
+                    self.axis_histories[i].clear()
 
-                self.hand_poses = smoothed_poses
-                self.prev_hand_poses = self.hand_poses.copy()
+                    hands[i].detected = False
+                    hands[i].pose = None
+                    hands[i].raw_cam_pos = None
+                    hands[i].axes = None
 
+            # Produce smoothed outputs (only if we have enough info)
+            for i in range(2):
+                if hands[i].detected and len(self.pose_histories[i]) > 0:
+                    hands[i].pose = self._smooth_pose(self.pose_histories[i])
+                    hands[i].axes = self._smooth_axes(self.axis_histories[i])
+
+            # Also keep legacy lists in sync (some downstream code expects these)
+            self.hand_poses = [h.pose for h in hands if h.pose is not None]
+            self.wrist_axes = [h.axes for h in hands if h.axes is not None]
+
+            if self.left_hand.pose is not None or self.right_hand.pose is not None:
                 # Check for start and end gestures
                 start_active = self.check_start_gesture()
-                end_active = (not start_active) and self.check_end_gesture()
+                end_active = (not start_active) and self.check_stop_gesture()
 
                 if start_active:
                     # Keep START text visible while gesture persists.
@@ -565,11 +642,10 @@ class Handtracking:
                         if self.gesture_step == 0:
                             self.callback_number = 1
                             self.gesture_step = 1
-                            # Set the starting hand offsets in RAW space (pre-offset robot_pos).
-                            # This avoids mixing smoothed/offset poses with raw landmark-derived positions.
-                            if len(raw_robot_positions) >= 2:
-                                self.start_left_offset = raw_robot_positions[0]
-                                self.start_right_offset = raw_robot_positions[1]
+                            # Store starting offsets in CAMERA frame (meters). Robot conversion happens at UDP pack time.
+                            if self.left_hand.raw_cam_pos is not None and self.right_hand.raw_cam_pos is not None:
+                                self.start_left_offset = self.left_hand.raw_cam_pos
+                                self.start_right_offset = self.right_hand.raw_cam_pos
                             print(f"Start gesture detected. Left offset: {self.start_left_offset}, Right offset: {self.start_right_offset}")
 
                             # Reset smoothing so we don't average pre-START poses into the new rebased frame.
@@ -578,16 +654,17 @@ class Handtracking:
                             for h in self.axis_histories:
                                 h.clear()
                             if len(self.hand_poses) >= 2:
-                                self.pose_histories[0].append(self._with_xyz(self.hand_poses[0], self.robot_left_offset))
-                                self.pose_histories[1].append(self._with_xyz(self.hand_poses[1], self.robot_right_offset))
+                                # Seed smoothing with the start offsets so the first rebased output is stable.
+                                self.pose_histories[0].append(self._with_xyz(self.hand_poses[0], self.start_left_offset))
+                                self.pose_histories[1].append(self._with_xyz(self.hand_poses[1], self.start_right_offset))
                         else:
                             self.callback_number = 0
                             self.episode_started = True
                 elif end_active:
-                    # Keep END text visible while gesture persists.
-                    cv2.putText(annotated, 'END', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3, cv2.LINE_AA)
-                    if self.active_gesture != 'end':
-                        self.active_gesture = 'end'
+                    # Keep STOP text visible while gesture persists.
+                    cv2.putText(annotated, 'STOP', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3, cv2.LINE_AA)
+                    if self.active_gesture != 'stop':
+                        self.active_gesture = 'stop'
                         self.gesture_step = 0
 
                     # Emit: 2 -> 3 -> 0 (once per sustained detection)
@@ -614,7 +691,7 @@ class Handtracking:
 
                 # Draw smoothed axes
                 scale = 80
-                for axes in smoothed_axes:
+                for axes in [self.left_hand.axes, self.right_hand.axes]:
                     if axes is None:
                         continue
                     origin, x_axis, y_axis, z_axis = axes
@@ -623,35 +700,58 @@ class Handtracking:
                         cv2.arrowedLine(annotated, origin, end_pt, color, 3, tipLength=0.2)
 
                 # Logging print
-                for idx, hand in enumerate(self.hand_poses):
+                for idx, hand in enumerate([self.left_hand.pose, self.right_hand.pose]):
+                    if hand is None:
+                        continue
                     hand_rpy = R.from_quat([hand[4], hand[5], hand[6], hand[3]]).as_euler('xyz', degrees=True)
                     output = "Left Hand:" if idx == 0 else "Right Hand:"
                     output += f"\n\tx={hand[0]:.2f} y={hand[1]:.2f} z={hand[2]:.2f}"
                     output += f"\n\tQw={hand[3]:.2f} Qx={hand[4]:.2f} Qy={hand[5]:.2f} Qz={hand[6]:.2f}"
                     # output += f"\n\tR={hand_rpy[0]:.1f} P={hand_rpy[1]:.1f} Y={hand_rpy[2]:.1f}\n"
-                    output += f"\tThumb={hand[7]:.3f} Index={hand[8]:.3f} Pinky={hand[9]:.3f}"
+                    output += f"\n\tIndex={hand[7]:.3f} Pinky={hand[8]:.3f} Thumb={hand[9]:.3f}"
                     print(output)
 
                 if self.callback_number > 0:
                     print(f"Sending callback number: {self.callback_number}")
 
                 # Send UDP message with hand pose data + callback number
-                left_hand = self.hand_poses[0]
-                right_hand = self.hand_poses[1] if len(self.hand_poses) > 1 else (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+                default_pose_cam = (0.5, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+                left_cam = self.left_hand.pose if self.left_hand.pose is not None else default_pose_cam
+                right_cam = self.right_hand.pose if self.right_hand.pose is not None else default_pose_cam
+
+                # Convert CAMERA -> ROBOT at the very end (right before UDP send)
+                left_cam_xyz = np.array(left_cam[0:3], dtype=np.float64)
+                right_cam_xyz = np.array(right_cam[0:3], dtype=np.float64)
+                left_robot_raw = self._cam_norm_to_robot_m(left_cam_xyz, 'left', x_scaling, y_scaling, z_scaling)
+                right_robot_raw = self._cam_norm_to_robot_m(right_cam_xyz, 'right', x_scaling, y_scaling, z_scaling)
+
+                if np.linalg.norm(self.start_left_offset) > 1e-6:
+                    start_left_robot = self._cam_norm_to_robot_m(self.start_left_offset, 'left', x_scaling, y_scaling, z_scaling)
+                    left_robot = left_robot_raw - start_left_robot + self.robot_left_offset
+                else:
+                    left_robot = left_robot_raw + self.robot_left_offset
+
+                if np.linalg.norm(self.start_right_offset) > 1e-6:
+                    start_right_robot = self._cam_norm_to_robot_m(self.start_right_offset, 'right', x_scaling, y_scaling, z_scaling)
+                    right_robot = right_robot_raw - start_right_robot + self.robot_right_offset
+                else:
+                    right_robot = right_robot_raw + self.robot_right_offset
 
                 # On the START frame, force the reported xyz to equal the IsaacSim offsets exactly.
-                # Orientation/fingers remain whatever is currently computed.
                 if self.active_gesture == 'start' and self.callback_number == 1 and len(self.hand_poses) >= 2:
-                    left_hand = self._with_xyz(left_hand, self.robot_left_offset)
-                    right_hand = self._with_xyz(right_hand, self.robot_right_offset)
-                pose_data = left_hand + right_hand + (float(self.callback_number),)
+                    left_robot = self.robot_left_offset.astype(np.float64)
+                    right_robot = self.robot_right_offset.astype(np.float64)
+
+                left_udp = (float(left_robot[0]), float(left_robot[1]), float(left_robot[2]), *left_cam[3:])
+                right_udp = (float(right_robot[0]), float(right_robot[1]), float(right_robot[2]), *right_cam[3:])
+                pose_data = left_udp + right_udp + (float(self.callback_number),)
 
                 msg = np.array(pose_data, dtype=np.float32).tobytes()
                 self.sock.sendto(msg, (self.udp_ip, self.udp_port))
 
                 self.callback_number = 0
 
-            cv2.imshow('Hand Landmarker (World + Manual Draw)', annotated)
+            cv2.imshow(window_name, annotated)
 
             key = cv2.waitKey(5) & 0xFF
             if key == 27:
@@ -660,9 +760,9 @@ class Handtracking:
                 self.mirror = not self.mirror
                 print(f"Mirror: {'ON' if self.mirror else 'OFF'}")
             elif key == ord('4') and primary_im_lm is not None:
-                self.calibrate_step1(primary_im_lm, primary_hand_size_px, primary_rot_mat)
+                self._calibrate_step_1(primary_im_lm, primary_hand_size_px, primary_rot_mat)
             elif key == ord('5') and primary_im_lm is not None and primary_hand_size_px is not None:
-                self.calibrate_step2(primary_im_lm, primary_hand_size_px)
+                self._calibrate_step_2(primary_im_lm, primary_hand_size_px)
             elif key == ord('1'):
                 self.callback_number = 1
                 self.override_gesture = True
@@ -684,5 +784,5 @@ if __name__ == "__main__":
     parser.add_argument('--udp_ip', type=str, default='127.0.0.1', help='UDP target IP')
     parser.add_argument('--udp_port', type=int, default=5005, help='UDP target port')
     args = parser.parse_args()
-    ht = Handtracking(udp_ip=args.udp_ip, udp_port=args.udp_port)
+    ht = HandTracking(udp_ip=args.udp_ip, udp_port=args.udp_port)
     ht.tracking_loop()
