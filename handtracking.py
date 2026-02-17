@@ -22,8 +22,8 @@ class HandData:
     # (x_n, y_n, z_n, qw, qx, qy, qz, index, pinky, thumb)
     # where x_n,y_n are the MediaPipe image landmark coords in [0,1]
     # and z_n is normalized depth (not clipped) with:
-    #   z_n=0  -> distance at _calibrate_step_1 (ref_dist_1)
-    #   z_n=1  -> distance at _calibrate_step_2 (ref_dist_2)
+    #   z_n=0  -> distance at calibrate_step_1 (ref_dist_1)
+    #   z_n=1  -> distance at calibrate_step_2 (ref_dist_2)
     # Values <0 or >1 mean extrapolation outside the calibration range.
     pose: Optional[tuple] = None
 
@@ -129,7 +129,7 @@ class HandTracking:
 
 
     @staticmethod
-    def _safe_normalize(v: np.ndarray, eps: float = 1e-8) -> Optional[np.ndarray]:
+    def safe_normalize(v: np.ndarray, eps: float = 1e-8) -> Optional[np.ndarray]:
         n = float(np.linalg.norm(v))
         if not np.isfinite(n) or n < eps:
             return None
@@ -137,7 +137,7 @@ class HandTracking:
 
 
     @staticmethod
-    def _rotation_angle_rad(rot_mat: np.ndarray) -> float:
+    def rotation_angle_rad(rot_mat: np.ndarray) -> float:
         """Angle of a rotation matrix (0..pi)."""
         tr = float(np.trace(rot_mat))
         c = (tr - 1.0) * 0.5
@@ -145,7 +145,7 @@ class HandTracking:
         return float(np.arccos(c))
 
 
-    def _choose_rel_rot_mat(
+    def choose_rel_rot_mat(
         self,
         prev_rel: Optional[np.ndarray],
         cand_a: Optional[np.ndarray],
@@ -162,13 +162,13 @@ class HandTracking:
             return (cand_a, False)
 
         # Choose by smallest relative rotation angle.
-        da = self._rotation_angle_rad(prev_rel.T @ cand_a)
-        db = self._rotation_angle_rad(prev_rel.T @ cand_b)
+        da = self.rotation_angle_rad(prev_rel.T @ cand_a)
+        db = self.rotation_angle_rad(prev_rel.T @ cand_b)
         return (cand_b, True) if db < da else (cand_a, False)
 
 
     @staticmethod
-    def _extract_handedness_and_score(landmark_data, idx: int) -> Tuple[Optional[str], float]:
+    def extract_handedness_and_score(landmark_data, idx: int) -> Tuple[Optional[str], float]:
         """Return ('left'|'right'|None, score)."""
         handedness = getattr(landmark_data, 'handedness', None)
         if not handedness or idx >= len(handedness):
@@ -201,7 +201,7 @@ class HandTracking:
         return (float(xyz[0]), float(xyz[1]), float(xyz[2]), *pose[3:])
 
 
-    def _cam_norm_to_robot_m(
+    def cam_norm_to_robot_m(
         self,
         cam_xyz_n: np.ndarray,
         side: str,
@@ -240,7 +240,7 @@ class HandTracking:
 
 
     @staticmethod
-    def _average_quaternions_wxyz(quats_wxyz: np.ndarray) -> np.ndarray:
+    def average_quaternions_wxyz(quats_wxyz: np.ndarray) -> np.ndarray:
         """Average quaternions with sign alignment. Input shape (N,4) as (qw,qx,qy,qz)."""
         if quats_wxyz.shape[0] == 1:
             q = quats_wxyz[0]
@@ -258,13 +258,13 @@ class HandTracking:
         return q_mean / norm
 
 
-    def _smooth_pose(self, pose_history: deque) -> tuple:
+    def smooth_pose(self, pose_history: deque) -> tuple:
         arr = np.array(pose_history, dtype=np.float64)
         if arr.ndim != 2 or arr.shape[1] < 7:
             return tuple(pose_history[-1])
 
         pos_mean = np.mean(arr[:, 0:3], axis=0)
-        quat_mean = self._average_quaternions_wxyz(arr[:, 3:7])
+        quat_mean = self.average_quaternions_wxyz(arr[:, 3:7])
 
         # Preserve and smooth finger values
         extras = ()
@@ -279,7 +279,7 @@ class HandTracking:
         )
 
 
-    def _smooth_axes(self, axes_history: deque):
+    def smooth_axes(self, axes_history: deque):
         if not axes_history:
             return None
 
@@ -319,7 +319,7 @@ class HandTracking:
         return c1 + (c2 - c1) * (z_cm - z1) / (z2 - z1)
 
 
-    def _calibrate_step_1(self, im_lm, hand_size_px, rot_mat):
+    def calibrate_step_1(self, im_lm, hand_size_px, rot_mat):
         if self.image_w is None or self.image_h is None:
             print("Image size not set yet; wait for a frame before calibrating.")
             return
@@ -337,7 +337,7 @@ class HandTracking:
         print("Calibration Step 1 completed")
 
 
-    def _calibrate_step_2(self, im_lm, hand_size_px):
+    def calibrate_step_2(self, im_lm, hand_size_px):
         if self.image_w is None or self.image_h is None:
             print("Image size not set yet; wait for a frame before calibrating.")
             return
@@ -364,16 +364,38 @@ class HandTracking:
         print("Calibration Step 2 completed")
 
 
-    def _finger_value(self, val, min_val, max_val):
+    def calculate_finger_values(self, im_lm, idx):
+        thumb_angle = self.finger_angle(im_lm, 1)
+        index_angle = self.finger_angle(im_lm, 5)
+        pinky_angle = self.finger_angle(im_lm, 17)
+
+        print(f"Hand {idx}: Thumb={thumb_angle:.3f}, Index={index_angle:.3f}, Pinky={pinky_angle:.3f}")
+
+        self.finger_values = [self.map_finger_value(index_angle, 1.0, 2.5),
+                              self.map_finger_value(pinky_angle, 1.0, 2.5),
+                              self.map_finger_value(thumb_angle, 1.5, 2.5)]
+
+
+    def map_finger_value(self, val, min_val, max_val):
         if val < min_val:
             return 0.0
         elif val > max_val:
             return 1.0
         else:
             return (val - min_val) / (max_val - min_val)
+        
+
+    def finger_angle(self, im_lm, base_idx):
+        base_vec = np.array([im_lm[base_idx + 1].x, im_lm[base_idx + 1].y, im_lm[base_idx + 1].z]) \
+                 - np.array([im_lm[base_idx].x, im_lm[base_idx].y, im_lm[base_idx].z])
+        tip_vec = np.array([im_lm[base_idx + 3].x, im_lm[base_idx + 3].y, im_lm[base_idx + 3].z]) \
+                - np.array([im_lm[base_idx + 2].x, im_lm[base_idx + 2].y, im_lm[base_idx + 2].z])
+        angle = np.arccos(np.clip(np.dot(base_vec, tip_vec) /
+                         (np.linalg.norm(base_vec) * np.linalg.norm(tip_vec) + 1e-8), -1.0, 1.0))
+        return 3.14 - angle
 
 
-    def _quaternion_distance(self, q1, q2):
+    def quaternion_distance(self, q1, q2):
         """Compute a distance metric between two quaternions (in wxyz format)."""
         q1 = np.array(q1)
         q2 = np.array(q2)
@@ -412,13 +434,13 @@ class HandTracking:
     
         # print("Start Gesture Check")
         # print(f"\tX error: {abs(avg_x - target_x):.2f}, Y: {avg_y:.2f} > {min_y}")
-        # print(f"\tLeft quat dist: {self._quaternion_distance(quat_left, target_quat_left):.2f}, Right quat dist: {self._quaternion_distance(quat_right, target_quat_right):.2f}")
+        # print(f"\tLeft quat dist: {self.quaternion_distance(quat_left, target_quat_left):.2f}, Right quat dist: {self.quaternion_distance(quat_right, target_quat_right):.2f}")
 
         return (abs(avg_x - target_x) < 0.2 and
                 abs(dist_x - target_x_dist) < 0.2 and
                 avg_y > min_y and
-                self._quaternion_distance(quat_left, target_quat_left) < 1.5 and
-                self._quaternion_distance(quat_right, target_quat_right) < 1.5 and
+                self.quaternion_distance(quat_left, target_quat_left) < 1.5 and
+                self.quaternion_distance(quat_right, target_quat_right) < 1.5 and
                 all(fv > 0.5 for fv in self.finger_values))
 
 
@@ -451,13 +473,13 @@ class HandTracking:
 
         # print("Stop Gesture Check")
         # print(f"\tX error: {abs(avg_x - target_x):.2f}, Y: {avg_y:.2f}")
-        # print(f"\tLeft quat dist: {self._quaternion_distance(quat_left, target_quat_left):.2f}, Right quat dist: {self._quaternion_distance(quat_right, target_quat_right):.2f}")
+        # print(f"\tLeft quat dist: {self.quaternion_distance(quat_left, target_quat_left):.2f}, Right quat dist: {self.quaternion_distance(quat_right, target_quat_right):.2f}")
 
         return (abs(avg_x - target_x) < 0.3 and
                 dist_x > min_x_dist and
                 avg_y < max_y and
-                self._quaternion_distance(quat_left, target_quat_left) < 0.7 and
-                self._quaternion_distance(quat_right, target_quat_right) < 0.7 and
+                self.quaternion_distance(quat_left, target_quat_left) < 0.7 and
+                self.quaternion_distance(quat_right, target_quat_right) < 0.7 and
                 all(fv > 0.5 for fv in self.finger_values))
 
 
@@ -522,7 +544,7 @@ class HandTracking:
                 for idx, w_lm in enumerate(landmark_data.hand_world_landmarks):
                     self.image_h, self.image_w, _ = image.shape
 
-                    det_side, det_side_score = self._extract_handedness_and_score(landmark_data, idx)
+                    det_side, det_side_score = self.extract_handedness_and_score(landmark_data, idx)
                     # If we mirror the image, handedness labels swap relative to the real hand.
                     if det_side is not None and self.mirror:
                         det_side = 'right' if det_side == 'left' else 'left'
@@ -553,7 +575,7 @@ class HandTracking:
                     vec_pinky_index = index_mcp - pinky_mcp
 
                     # Robust basis construction: skip/hold when the geometry is ill-conditioned.
-                    y_axis = self._safe_normalize(vec_middle)
+                    y_axis = self.safe_normalize(vec_middle)
                     z_axis = None
                     x_axis = None
                     rot_cam = None
@@ -562,9 +584,9 @@ class HandTracking:
                     rot_mat_flip = None
 
                     if y_axis is not None:
-                        z_axis = self._safe_normalize(np.cross(vec_pinky_index, y_axis))
+                        z_axis = self.safe_normalize(np.cross(vec_pinky_index, y_axis))
                         if z_axis is not None:
-                            x_axis = self._safe_normalize(np.cross(y_axis, z_axis))
+                            x_axis = self.safe_normalize(np.cross(y_axis, z_axis))
                     if x_axis is not None and y_axis is not None and z_axis is not None:
                         rot_cam = np.column_stack((x_axis, y_axis, z_axis))
                         rot_mat = self.reorient_mat @ rot_cam
@@ -628,23 +650,6 @@ class HandTracking:
                             rel_rot_mat_flip = self.robot_frame_change_basis @ rel_rot_mat_flip @ self.robot_frame_change_basis.T
                             rel_rot_mat_flip = self.robot_frame_rotation @ rel_rot_mat_flip
 
-                        # Calculate midpoint of wrist, middle_mcp, and pinky_mcp
-                        palm_center = (wrist + middle_mcp + pinky_mcp) / 3.0
-                        thumb_tip = np.array([w_lm[4].x, w_lm[4].y, w_lm[4].z])
-                        index_tip = np.array([w_lm[8].x, w_lm[8].y, w_lm[8].z])
-                        pinky_tip = np.array([w_lm[20].x, w_lm[20].y, w_lm[20].z])
-                        # Calculate distance of each fingertip to the palm center
-                        wrist_palm_dist = np.linalg.norm(palm_center - wrist)
-                        thumb_dist = np.linalg.norm(thumb_tip - palm_center) / wrist_palm_dist
-                        index_dist = np.linalg.norm(index_tip - palm_center) / wrist_palm_dist
-                        pinky_dist = np.linalg.norm(pinky_tip - palm_center) / wrist_palm_dist
-
-                        # print(f"Hand {idx}: Wrist-Palm Dist={wrist_palm_dist:.3f}, Thumb={thumb_dist:.3f}, Index={index_dist:.3f}, Pinky={pinky_dist:.3f}")
-
-                        self.finger_values = [self._finger_value(index_dist, 1.4, 1.9),
-                                              self._finger_value(pinky_dist, 1.2, 1.5),
-                                              self._finger_value(thumb_dist, 0.8, 1.6)]
-
                         # Visualize selected palm edge
                         conn = self.PALM_CONNECTIONS[best_idx]
                         start = im_lm[conn[0]]
@@ -663,6 +668,8 @@ class HandTracking:
                         if x_axis is not None and y_axis is not None and z_axis is not None:
                             axes = (origin, x_axis, y_axis, z_axis)
                             axes_flip = (origin, -x_axis, y_axis, -z_axis)
+
+                        self.calculate_finger_values(im_lm, idx)
 
                         detections.append({
                             'cam_pos_n': cam_pos_n,
@@ -713,7 +720,7 @@ class HandTracking:
                 if det is not None:
                     raw_pos = det['raw_cam_pos']
 
-                    chosen_rel, chose_flip = self._choose_rel_rot_mat(
+                    chosen_rel, chose_flip = self.choose_rel_rot_mat(
                         hands[i].prev_rel_rot_mat,
                         det.get('rel_rot_mat'),
                         det.get('rel_rot_mat_flip'),
@@ -756,8 +763,8 @@ class HandTracking:
             # Produce smoothed outputs (only if we have enough info)
             for i in range(2):
                 if hands[i].detected and len(self.pose_histories[i]) > 0:
-                    hands[i].pose = self._smooth_pose(self.pose_histories[i])
-                    hands[i].axes = self._smooth_axes(self.axis_histories[i]) if len(self.axis_histories[i]) > 0 else None
+                    hands[i].pose = self.smooth_pose(self.pose_histories[i])
+                    hands[i].axes = self.smooth_axes(self.axis_histories[i]) if len(self.axis_histories[i]) > 0 else None
 
             # Also keep legacy lists in sync (some downstream code expects these)
             self.hand_poses = [h.pose for h in hands if h.pose is not None]
@@ -872,17 +879,17 @@ class HandTracking:
                 # Convert CAMERA -> ROBOT at the very end (right before UDP send)
                 left_cam_xyz = np.array(left_cam[0:3], dtype=np.float64)
                 right_cam_xyz = np.array(right_cam[0:3], dtype=np.float64)
-                left_robot_raw = self._cam_norm_to_robot_m(left_cam_xyz, 'left', x_scaling, y_scaling, z_scaling)
-                right_robot_raw = self._cam_norm_to_robot_m(right_cam_xyz, 'right', x_scaling, y_scaling, z_scaling)
+                left_robot_raw = self.cam_norm_to_robot_m(left_cam_xyz, 'left', x_scaling, y_scaling, z_scaling)
+                right_robot_raw = self.cam_norm_to_robot_m(right_cam_xyz, 'right', x_scaling, y_scaling, z_scaling)
 
                 if np.linalg.norm(self.start_left_offset) > 1e-6:
-                    start_left_robot = self._cam_norm_to_robot_m(self.start_left_offset, 'left', x_scaling, y_scaling, z_scaling)
+                    start_left_robot = self.cam_norm_to_robot_m(self.start_left_offset, 'left', x_scaling, y_scaling, z_scaling)
                     left_robot = left_robot_raw - start_left_robot + self.robot_left_offset
                 else:
                     left_robot = left_robot_raw + self.robot_left_offset
 
                 if np.linalg.norm(self.start_right_offset) > 1e-6:
-                    start_right_robot = self._cam_norm_to_robot_m(self.start_right_offset, 'right', x_scaling, y_scaling, z_scaling)
+                    start_right_robot = self.cam_norm_to_robot_m(self.start_right_offset, 'right', x_scaling, y_scaling, z_scaling)
                     right_robot = right_robot_raw - start_right_robot + self.robot_right_offset
                 else:
                     right_robot = right_robot_raw + self.robot_right_offset
@@ -910,9 +917,9 @@ class HandTracking:
                 self.mirror = not self.mirror
                 print(f"Mirror: {'ON' if self.mirror else 'OFF'}")
             elif key == ord('4') and primary_im_lm is not None:
-                self._calibrate_step_1(primary_im_lm, primary_hand_size_px, primary_rot_mat)
+                self.calibrate_step_1(primary_im_lm, primary_hand_size_px, primary_rot_mat)
             elif key == ord('5') and primary_im_lm is not None and primary_hand_size_px is not None:
-                self._calibrate_step_2(primary_im_lm, primary_hand_size_px)
+                self.calibrate_step_2(primary_im_lm, primary_hand_size_px)
             elif key == ord('1'):
                 self.callback_number = 1
                 self.override_gesture = True
