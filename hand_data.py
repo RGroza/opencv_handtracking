@@ -59,6 +59,40 @@ class HandData:
         self.axes_history.clear()
 
 
+    def ingest_frame(
+        self,
+        *,
+        cam_pos_n: np.ndarray,
+        quat_wxyz: Tuple[float, float, float, float],
+        finger_values: Tuple[float, float, float],
+        raw_cam_pos: Optional[np.ndarray] = None,
+        axes: Optional[Tuple[Tuple[int, int], np.ndarray, np.ndarray, np.ndarray]] = None,
+        chosen_rel_rot_mat: Optional[np.ndarray] = None,
+    ) -> None:
+        """Ingest a single per-frame measurement into the smoothing window."""
+        if raw_cam_pos is None:
+            raw_cam_pos = np.asarray(cam_pos_n, dtype=np.float64)
+
+        self.detected = True
+        self.raw_cam_pos = np.asarray(raw_cam_pos, dtype=np.float64)
+        self.finger_values = tuple(float(v) for v in finger_values)
+
+        qw, qx, qy, qz = (float(quat_wxyz[0]), float(quat_wxyz[1]), float(quat_wxyz[2]), float(quat_wxyz[3]))
+        fv0, fv1, fv2 = (float(self.finger_values[0]), float(self.finger_values[1]), float(self.finger_values[2]))
+        cam_pos_n = np.asarray(cam_pos_n, dtype=np.float64)
+        pose = (
+            float(cam_pos_n[0]), float(cam_pos_n[1]), float(cam_pos_n[2]),
+            qw, qx, qy, qz,
+            fv0, fv1, fv2,
+        )
+
+        self.pose_history.append(pose)
+        if axes is not None:
+            self.axes_history.append(axes)
+        if chosen_rel_rot_mat is not None:
+            self.prev_rel_rot_mat = chosen_rel_rot_mat
+
+
     def has_start_offset(self, eps: float = 1e-6) -> bool:
         return bool(np.linalg.norm(self.start_offset_cam) > eps)
 

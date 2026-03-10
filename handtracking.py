@@ -6,8 +6,23 @@ import numpy as np
 import argparse
 from scipy.spatial.transform import Rotation as R
 from typing import Optional, Tuple
+from dataclasses import dataclass
 import socket
 from hand_data import HandData
+
+
+@dataclass
+class FrameDetection:
+    cam_pos_n: np.ndarray
+    raw_cam_pos: np.ndarray
+    finger_values: Tuple[float, float, float]
+    rel_rot_mat_a: Optional[np.ndarray]
+    rel_rot_mat_b: Optional[np.ndarray]
+    axes_a: Optional[Tuple[Tuple[int, int], np.ndarray, np.ndarray, np.ndarray]]
+    axes_b: Optional[Tuple[Tuple[int, int], np.ndarray, np.ndarray, np.ndarray]]
+    order_x: int
+    handedness: Optional[str]
+    handedness_score: float
 
 
 class HandTracking:
@@ -56,6 +71,7 @@ class HandTracking:
         )
         self.robot_frame_rotation = np.diag([1, -1, -1])
         self.robot_frame_change_basis = np.diag([1, 1, -1])
+        self.robot_frame_pitch_rotation = R.from_euler('x', -60, degrees=True).as_matrix()
 
         # Persistent per-hand containers (updated every frame)
         self.smoothing_window = 10
@@ -190,7 +206,7 @@ class HandTracking:
 
 
     @staticmethod
-    def _with_xyz(pose: tuple, xyz: np.ndarray) -> tuple:
+    def with_xyz(pose: tuple, xyz: np.ndarray) -> tuple:
         return (float(xyz[0]), float(xyz[1]), float(xyz[2]), *pose[3:])
 
 
@@ -382,6 +398,122 @@ class HandTracking:
             all(fv > 0.95 for fv in (*left_fv, *right_fv)))
 
 
+    @staticmethod
+    def pos_cost(a: np.ndarray, b: np.ndarray, z_weight: float = 0.5) -> float:
+        """Distance cost for association in camera-normalized space."""
+        da = np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)
+        if da.shape[0] >= 3:
+            da = np.array([da[0], da[1], da[2] * z_weight], dtype=np.float64)
+        return float(np.linalg.norm(da))
+
+
+    def assign_detections_temporal(
+        self,
+        detections: list[FrameDetection],
+        prev_left: Optional[np.ndarray],
+        prev_right: Optional[np.ndarray],
+    ) -> list[Optional[FrameDetection]]:
+        """Assign detections to (left,right) using handedness + temporal position continuity.
+
+        Goal: avoid random left/right switching by preferring the assignment that minimizes
+        movement relative to the previous frame's positions.
+        """
+        assigned: list[Optional[FrameDetection]] = [None, None]
+        if not detections:
+            return assigned
+
+        # If we only have one detection, bind it to the closest previously-tracked hand.
+        if len(detections) == 1:
+            det = detections[0]
+            if prev_left is not None and prev_right is not None:
+                dl = self.pos_cost(det.cam_pos_n, prev_left)
+                dr = self.pos_cost(det.cam_pos_n, prev_right)
+                assigned[0 if dl <= dr else 1] = det
+                return assigned
+            # Fall back to handedness when available.
+            if det.handedness in ('left', 'right'):
+                assigned[0 if det.handedness == 'left' else 1] = det
+            else:
+                # Final fallback: x-order relative to image center.
+                assigned[0 if det.order_x < int((self.image_w or 0) * 0.5) else 1] = det
+            return assigned
+
+        # Keep at most two detections (num_hands=2). Prefer higher handedness confidence when available.
+        dets = detections
+        if len(dets) > 2:
+            dets = sorted(dets, key=lambda d: float(d.handedness_score), reverse=True)[:2]
+
+        d0, d1 = dets[0], dets[1]
+
+        # If we have both previous positions, choose the assignment with smaller total motion.
+        if prev_left is not None and prev_right is not None:
+            # Position-only costs.
+            cost_keep = self.pos_cost(d0.cam_pos_n, prev_left) + self.pos_cost(d1.cam_pos_n, prev_right)
+            cost_swap = self.pos_cost(d0.cam_pos_n, prev_right) + self.pos_cost(d1.cam_pos_n, prev_left)
+
+            # Add a small penalty when explicit handedness disagrees with the slot.
+            def handedness_penalty(det: FrameDetection, slot: int) -> float:
+                if det.handedness not in ('left', 'right'):
+                    return 0.0
+                want = 'left' if slot == 0 else 'right'
+                if det.handedness == want:
+                    return 0.0
+                # Higher score => stronger disagreement => larger penalty.
+                return 0.15 + 0.25 * float(det.handedness_score)
+
+            cost_keep += handedness_penalty(d0, 0) + handedness_penalty(d1, 1)
+            cost_swap += handedness_penalty(d0, 1) + handedness_penalty(d1, 0)
+
+            # Hysteresis: only swap if it is meaningfully better.
+            swap_margin = 0.08
+            if cost_swap + swap_margin < cost_keep:
+                assigned[0], assigned[1] = d1, d0
+            else:
+                assigned[0], assigned[1] = d0, d1
+            return assigned
+
+        # If we only have one previous position, bind the closest detection to that side.
+        if prev_left is not None and prev_right is None:
+            dl0 = self.pos_cost(d0.cam_pos_n, prev_left)
+            dl1 = self.pos_cost(d1.cam_pos_n, prev_left)
+            if dl0 <= dl1:
+                assigned[0], assigned[1] = d0, d1
+            else:
+                assigned[0], assigned[1] = d1, d0
+            return assigned
+        if prev_right is not None and prev_left is None:
+            dr0 = self.pos_cost(d0.cam_pos_n, prev_right)
+            dr1 = self.pos_cost(d1.cam_pos_n, prev_right)
+            if dr0 <= dr1:
+                assigned[1], assigned[0] = d0, d1
+            else:
+                assigned[1], assigned[0] = d1, d0
+            return assigned
+
+        # No temporal info: fall back to stable ordering by handedness then x.
+        # Place by handedness if possible.
+        for det in dets:
+            if det.handedness not in ('left', 'right'):
+                continue
+            slot = 0 if det.handedness == 'left' else 1
+            if assigned[slot] is None:
+                assigned[slot] = det
+            else:
+                if float(det.handedness_score) > float(assigned[slot].handedness_score):
+                    assigned[slot] = det
+
+        # Fill remaining slots by x-order.
+        used_ids = set(id(d) for d in assigned if d is not None)
+        remaining = [d for d in dets if id(d) not in used_ids]
+        remaining_sorted = sorted(remaining, key=lambda d: d.order_x)
+        for det in remaining_sorted:
+            if assigned[0] is None:
+                assigned[0] = det
+            elif assigned[1] is None:
+                assigned[1] = det
+        return assigned
+
+
     def tracking_loop(self):
         cap = cv2.VideoCapture(0)
         frame_timestamp_ms = 0
@@ -405,8 +537,8 @@ class HandTracking:
             if not success:
                 break
 
-            # Per-frame detection list; we will assign them to (left, right)
-            detections = []
+            # Per-frame detections; assign them to (left, right)
+            frame_detections: list[FrameDetection] = []
 
             if self.mirror:
                 image = cv2.flip(image, 1)
@@ -582,11 +714,13 @@ class HandTracking:
                             rel_rot_mat_a = rot_mat_a @ self.ref_rot_mat.T
                             rel_rot_mat_a = self.robot_frame_change_basis @ rel_rot_mat_a @ self.robot_frame_change_basis.T
                             rel_rot_mat_a = self.robot_frame_rotation @ rel_rot_mat_a
+                            rel_rot_mat_a = self.robot_frame_pitch_rotation @ rel_rot_mat_a
 
                         if rot_mat_b is not None and self.ref_rot_mat is not None:
                             rel_rot_mat_b = rot_mat_b @ self.ref_rot_mat.T
                             rel_rot_mat_b = self.robot_frame_change_basis @ rel_rot_mat_b @ self.robot_frame_change_basis.T
                             rel_rot_mat_b = self.robot_frame_rotation @ rel_rot_mat_b
+                            rel_rot_mat_b = self.robot_frame_pitch_rotation @ rel_rot_mat_b
 
                         # Visualize selected palm edge
                         conn = self.PALM_CONNECTIONS[best_idx]
@@ -613,59 +747,36 @@ class HandTracking:
                         # Compute finger values per-detection (assigned to HandData after left/right association)
                         fv_tuple = HandData.compute_finger_values(im_lm)
 
-                        detections.append({
-                            'cam_pos_n': cam_pos_n,
-                            'finger_values': tuple(float(v) for v in fv_tuple),
-                            'rel_rot_mat_a': rel_rot_mat_a,
-                            'rel_rot_mat_b': rel_rot_mat_b,
-                            'raw_cam_pos': cam_pos_n,
-                            'axes_a': axes_a,
-                            'axes_b': axes_b,
-                            'order_x': origin[0],
-                            'handedness': det_side,
-                            'handedness_score': float(det_side_score),
-                            'origin': origin,
-                        })
+                        frame_detections.append(
+                            FrameDetection(
+                                cam_pos_n=cam_pos_n,
+                                raw_cam_pos=cam_pos_n,
+                                finger_values=tuple(float(v) for v in fv_tuple),
+                                rel_rot_mat_a=rel_rot_mat_a,
+                                rel_rot_mat_b=rel_rot_mat_b,
+                                axes_a=axes_a,
+                                axes_b=axes_b,
+                                order_x=int(origin[0]),
+                                handedness=det_side,
+                                handedness_score=float(det_side_score),
+                            )
+                        )
 
-            # Assign detections to (left, right) ordering using handedness when available.
-            assigned = [None, None]  # 0=left, 1=right
-
-            # First pass: place by handedness
-            for det in detections:
-                side = det.get('handedness')
-                if side not in ('left', 'right'):
-                    continue
-                slot = 0 if side == 'left' else 1
-                if assigned[slot] is None:
-                    assigned[slot] = det
-                else:
-                    # Tie-break by higher handedness confidence
-                    if float(det.get('handedness_score', 0.0)) > float(assigned[slot].get('handedness_score', 0.0)):
-                        assigned[slot] = det
-
-            # Second pass: fill remaining slots by x-order with unassigned detections
-            used_ids = set(id(d) for d in assigned if d is not None)
-            remaining = [d for d in detections if id(d) not in used_ids]
-            remaining_sorted = sorted(remaining, key=lambda d: d['order_x'])
-            for det in remaining_sorted:
-                if assigned[0] is None:
-                    assigned[0] = det
-                elif assigned[1] is None:
-                    assigned[1] = det
-                else:
-                    break
+            # Temporal association to prevent random left/right switching.
+            prev_left = self.left_hand.raw_cam_pos if self.left_hand.detected else None
+            prev_right = self.right_hand.raw_cam_pos if self.right_hand.detected else None
+            assigned = self.assign_detections_temporal(frame_detections, prev_left, prev_right)
 
             # Moving-average smoothing over last N frames (per hand index)
             hands = [self.left_hand, self.right_hand]
             for i in range(2):
                 det = assigned[i]
                 if det is not None:
-                    raw_pos = det['raw_cam_pos']
-
+                    raw_pos = det.raw_cam_pos
                     chosen_rel, chose_flip = self.choose_rel_rot_mat(
                         hands[i].prev_rel_rot_mat,
-                        det.get('rel_rot_mat_a'),
-                        det.get('rel_rot_mat_b'),
+                        det.rel_rot_mat_a,
+                        det.rel_rot_mat_b,
                     )
 
                     if chosen_rel is None:
@@ -674,29 +785,19 @@ class HandTracking:
                     else:
                         quat = R.from_matrix(chosen_rel).as_quat()  # [x, y, z, w]
                         qw, qx, qy, qz = quat[3], quat[0], quat[1], quat[2]
-                        hands[i].prev_rel_rot_mat = chosen_rel
 
-                    cam_pos_n = det['cam_pos_n']
-                    fv = det['finger_values']
-                    pose = (
-                        float(cam_pos_n[0]), float(cam_pos_n[1]), float(cam_pos_n[2]),
-                        float(qw), float(qx), float(qy), float(qz),
-                        float(fv[0]), float(fv[1]), float(fv[2]),
+                    cam_pos_n = det.cam_pos_n
+                    fv = det.finger_values
+                    axes = det.axes_b if chose_flip else det.axes_a
+
+                    hands[i].ingest_frame(
+                        cam_pos_n=cam_pos_n,
+                        quat_wxyz=(qw, qx, qy, qz),
+                        finger_values=fv,
+                        raw_cam_pos=raw_pos,
+                        axes=axes,
+                        chosen_rel_rot_mat=chosen_rel,
                     )
-
-                    axes = det.get('axes')
-                    if chose_flip:
-                        axes = det.get('axes_b')
-                    else:
-                        axes = det.get('axes_a')
-
-                    hands[i].pose_history.append(pose)
-                    if axes is not None:
-                        hands[i].axes_history.append(axes)
-
-                    hands[i].detected = True
-                    hands[i].raw_cam_pos = raw_pos
-                    hands[i].finger_values = det.get('finger_values')
                 else:
                     hands[i].clear()
 
@@ -732,8 +833,8 @@ class HandTracking:
                             self.right_hand.clear_histories()
                             if self.left_hand.pose is not None and self.right_hand.pose is not None:
                                 # Seed smoothing with the start offsets so the first rebased output is stable.
-                                self.left_hand.pose_history.append(self._with_xyz(self.left_hand.pose, self.left_hand.start_offset_cam))
-                                self.right_hand.pose_history.append(self._with_xyz(self.right_hand.pose, self.right_hand.start_offset_cam))
+                                self.left_hand.pose_history.append(self.with_xyz(self.left_hand.pose, self.left_hand.start_offset_cam))
+                                self.right_hand.pose_history.append(self.with_xyz(self.right_hand.pose, self.right_hand.start_offset_cam))
                         else:
                             self.callback_number = 0
                             self.episode_started = True
