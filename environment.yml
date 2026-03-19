@@ -1,4 +1,4 @@
-name: opencv-handtracking
+name: opencv_handtracking
 channels:
   - conda-forge
 dependencies:

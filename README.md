@@ -4,7 +4,7 @@
 
 ```bash
 conda env create -f environment.yml
-conda activate opencv-handtracking
+conda activate opencv_handtracking
 python -c "import cv2, mediapipe, numpy, scipy; print('Imports OK')"
 python handtracking.py
 ```
