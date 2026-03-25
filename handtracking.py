@@ -45,7 +45,7 @@ class HandTracking:
     RADIUS = 4
 
 
-    def __init__(self, udp_ip='127.0.0.1', udp_port=5005):
+    def __init__(self, udp_ip='127.0.0.1', udp_port=5005, video_source='0'):
         self.mirror = True
         self.image_w = None
         self.image_h = None
@@ -89,6 +89,9 @@ class HandTracking:
         self.udp_ip = udp_ip
         self.udp_port = udp_port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        # Video input setup
+        self.video_source = video_source
 
         BaseOptions = python.BaseOptions
         HandLandmarkerOptions = vision.HandLandmarkerOptions
@@ -354,7 +357,7 @@ class HandTracking:
         '''
         if self.left_hand.pose is None or self.right_hand.pose is None:
             return False
-        
+
         left_hand = self.left_hand.pose
         right_hand = self.right_hand.pose
 
@@ -363,7 +366,7 @@ class HandTracking:
         dist_x = abs(left_hand[0] - right_hand[0])
         quat_left = [left_hand[3], left_hand[4], left_hand[5], left_hand[6]]
         quat_right = [right_hand[3], right_hand[4], right_hand[5], right_hand[6]]
-    
+
         # print("Start Gesture Check")
         # print(f"\tX error: {abs(avg_x - target_x):.2f}, Y: {avg_y:.2f} > {min_y}")
         # print(f"\tLeft quat dist: {self.quaternion_distance(quat_left, target_quat_left):.2f}, Right quat dist: {self.quaternion_distance(quat_right, target_quat_right):.2f}")
@@ -407,7 +410,7 @@ class HandTracking:
         '''
         if self.left_hand.pose is None or self.right_hand.pose is None:
             return False
-        
+
         left_hand = self.left_hand.pose
         right_hand = self.right_hand.pose
 
@@ -641,7 +644,20 @@ class HandTracking:
 
 
     def tracking_loop(self):
-        cap = cv2.VideoCapture(0)
+        if args.video_source.isdigit():
+            cap = cv2.VideoCapture(int(args.video_source))  # Local camera
+        else:
+            cap = cv2.VideoCapture(args.video_source, cv2.CAP_FFMPEG)  # RTSP - MediaMTX
+
+        # Reduce internal frame buffering to 1 frame.
+        # This minimizes latency (important for real-time tracking),
+        # but may increase the chance of dropped frames if processing is slow.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Request ~30 FPS input rate.
+        # Acts as a hint; real FPS is determined by the camera/stream and may differ.
+        cap.set(cv2.CAP_PROP_FPS, 30)
+
         frame_timestamp_ms = 0
         window_name = 'Hand Tracking'
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -732,7 +748,7 @@ class HandTracking:
             primary_im_lm = None
             primary_hand_size_px = None
             primary_rot_mat = None
-            
+
             if landmark_data.hand_world_landmarks:
                 for idx, w_lm in enumerate(landmark_data.hand_world_landmarks):
                     self.image_h, self.image_w, _ = image.shape
@@ -1141,6 +1157,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--udp_ip', type=str, default='127.0.0.1', help='UDP target IP')
     parser.add_argument('--udp_port', type=int, default=5005, help='UDP target port')
+    # parser.add_argument('--video_source', type=str, default='0', help='Camera index or RTSP URL (default: local webcam)')
+    parser.add_argument('--video_source', type=str, default='rtsp://127.0.0.1:8554/webcam?rtsp_transport=udp', help='Camera index or RTSP URL (default: local MediaMTX server)')
     args = parser.parse_args()
     ht = HandTracking(udp_ip=args.udp_ip, udp_port=args.udp_port)
     ht.tracking_loop()
