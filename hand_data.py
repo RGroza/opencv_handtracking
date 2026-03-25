@@ -54,6 +54,12 @@ class HandData:
         self.finger_values = None
 
 
+    def mark_not_detected(self) -> None:
+        """Mark hand as not currently detected but preserve last known position."""
+        self.detected = False
+        # Don't clear pose, raw_cam_pos, axes, or finger_values - keep last known state
+
+
     def clear_histories(self) -> None:
         self.pose_history.clear()
         self.axes_history.clear()
@@ -188,9 +194,7 @@ class HandData:
         if self.detected and self.pose_history:
             self.pose = self.smooth_pose()
             self.axes = self.smooth_axes() if self.axes_history else None
-        else:
-            self.pose = None
-            self.axes = None
+        # If not detected, preserve the last known pose and axes (don't set to None)
 
 
     @staticmethod
