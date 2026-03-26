@@ -1,4 +1,3 @@
-#! /usr/bin/env python3
 import cv2
 import mediapipe as mp
 from mediapipe.tasks import python
@@ -10,67 +9,6 @@ from typing import Optional, Tuple
 from dataclasses import dataclass
 import socket
 from hand_data import HandData
-
-import threading
-import time
-
-class VideoCaptureAsync:
-    def __init__(self, video_source):
-        if video_source.isdigit():
-            cap = cv2.VideoCapture(int(video_source))  # Local camera
-        else:
-            cap = cv2.VideoCapture(video_source, cv2.CAP_FFMPEG)  # RTSP - MediaMTX
-
-        self.cap = cap
-        print('\n')
-
-        time.sleep(0.5)
-        # Try to open stream quickly
-        if not self.cap.isOpened():
-            raise RuntimeError(
-                "❌ Unable to open video source.\n"
-                "Make sure webcam/MediaMTX is streaming before running this script.\n"
-                f"Source: {video_source}"
-            )
-
-        # Try grabbing a first frame to ensure it's really alive
-        ok, _ = self.cap.read()
-        if not ok:
-            raise RuntimeError(
-                "❌ Stream opened but no frames received.\n"
-                "Start publishing the stream first (webcam/MediaMTX)."
-            )
-
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        # Reduce internal frame buffering to 1 frame.
-        # This minimizes latency (important for real-time tracking),
-        # but may increase the chance of dropped frames if processing is slow.
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        # Request ~30 FPS input rate.
-        # # Acts as a hint; real FPS is determined by the camera/stream and may differ.
-        # self.cap.set(cv2.CAP_PROP_FPS, 30)
-        self.frame = None
-        self.succeeded = False
-        self.running = True
-        self.thread = threading.Thread(target=self.update)
-        self.thread.start()
-
-    def update(self):
-        while self.running:
-            self.succeeded, frame = self.cap.read()
-            if self.succeeded:
-                self.frame = frame
-
-    def read(self):
-        return self.frame
-
-    def isOpened(self):
-        return self.cap.isOpened()
-
-    def release(self):
-        return self.cap.release()
 
 
 @dataclass
@@ -580,7 +518,20 @@ class HandTracking:
 
 
     def tracking_loop(self):
-        cap = VideoCaptureAsync(args.video_source)
+        if args.video_source.isdigit():
+            cap = cv2.VideoCapture(int(args.video_source))  # Local camera
+        else:
+            cap = cv2.VideoCapture(args.video_source, cv2.CAP_FFMPEG)  # RTSP - MediaMTX
+
+        # Reduce internal frame buffering to 1 frame.
+        # This minimizes latency (important for real-time tracking),
+        # but may increase the chance of dropped frames if processing is slow.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Request ~30 FPS input rate.
+        # Acts as a hint; real FPS is determined by the camera/stream and may differ.
+        cap.set(cv2.CAP_PROP_FPS, 30)
+
         frame_timestamp_ms = 0
         window_name = 'Hand Tracking'
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -598,9 +549,8 @@ class HandTracking:
         cv2.createTrackbar('Depth', window_name, int(1.0 * scale_mult), scale_max, _noop)
 
         while cap.isOpened():
-            image = cap.read()
-
-            if not cap.succeeded:
+            success, image = cap.read()
+            if not success:
                 break
 
             # Per-frame detections; assign them to (left, right)
