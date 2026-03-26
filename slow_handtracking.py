@@ -1,4 +1,3 @@
-#! /usr/bin/env python3
 import cv2
 import mediapipe as mp
 from mediapipe.tasks import python
@@ -9,70 +8,7 @@ from scipy.spatial.transform import Rotation as R
 from typing import Optional, Tuple
 from dataclasses import dataclass
 import socket
-import yaml
-from pathlib import Path
 from hand_data import HandData
-
-import threading
-import time
-
-class VideoCaptureAsync:
-    def __init__(self, video_source):
-        if video_source.isdigit():
-            cap = cv2.VideoCapture(int(video_source))  # Local camera
-        else:
-            cap = cv2.VideoCapture(video_source, cv2.CAP_FFMPEG)  # RTSP - MediaMTX
-
-        self.cap = cap
-        print('\n')
-
-        time.sleep(0.5)
-        # Try to open stream quickly
-        if not self.cap.isOpened():
-            raise RuntimeError(
-                "❌ Unable to open video source.\n"
-                "Make sure webcam/MediaMTX is streaming before running this script.\n"
-                f"Source: {video_source}"
-            )
-
-        # Try grabbing a first frame to ensure it's really alive
-        ok, _ = self.cap.read()
-        if not ok:
-            raise RuntimeError(
-                "❌ Stream opened but no frames received.\n"
-                "Start publishing the stream first (webcam/MediaMTX)."
-            )
-
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        # Reduce internal frame buffering to 1 frame.
-        # This minimizes latency (important for real-time tracking),
-        # but may increase the chance of dropped frames if processing is slow.
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        # Request ~30 FPS input rate.
-        # # Acts as a hint; real FPS is determined by the camera/stream and may differ.
-        # self.cap.set(cv2.CAP_PROP_FPS, 30)
-        self.frame = None
-        self.succeeded = False
-        self.running = True
-        self.thread = threading.Thread(target=self.update)
-        self.thread.start()
-
-    def update(self):
-        while self.running:
-            self.succeeded, frame = self.cap.read()
-            if self.succeeded:
-                self.frame = frame
-
-    def read(self):
-        return self.frame
-
-    def isOpened(self):
-        return self.cap.isOpened()
-
-    def release(self):
-        return self.cap.release()
 
 
 @dataclass
@@ -135,12 +71,7 @@ class HandTracking:
         )
         self.robot_frame_rotation = np.diag([1, -1, -1])
         self.robot_frame_change_basis = np.diag([1, 1, -1])
-        
-        # Pitch angles (adjustable via UI sliders)
-        self.camera_pitch_deg = 15.0  # Camera tilt upward
-        self.robot_frame_pitch_deg = -60.0  # Robot frame pitch
-        self.camera_pitch_rotation = R.from_euler('x', self.camera_pitch_deg, degrees=True).as_matrix()
-        self.robot_frame_pitch_rotation = R.from_euler('x', self.robot_frame_pitch_deg, degrees=True).as_matrix()
+        self.robot_frame_pitch_rotation = R.from_euler('x', -60, degrees=True).as_matrix()
 
         # Persistent per-hand containers (updated every frame)
         self.smoothing_window = 10
@@ -177,19 +108,6 @@ class HandTracking:
 
         self.left_hand.robot_offset = np.array([-0.15, 0.2, 0.85], dtype=np.float64)
         self.right_hand.robot_offset = np.array([0.15, 0.2, 0.85], dtype=np.float64)
-
-        # Trackbar visibility state
-        self.trackbars_visible = True
-        self.saved_trackbar_values = {}
-        
-        # Overlay visibility state
-        self.overlay_visible = True
-        
-        # Parameter file path
-        self.params_file = Path('handtracking_params.yaml')
-        
-        # Load parameters from file if it exists
-        self.load_parameters()
 
 
     @staticmethod
@@ -330,23 +248,16 @@ class HandTracking:
         x_cm = -cm_per_px * (wrist_px_x - anchor * float(self.image_w))
         y_cm = -cm_per_px * (wrist_px_y - float(self.image_h) / 2.0)
 
-        # Camera-frame position in cm (X: lateral, Y: vertical, Z: depth)
-        cam_pos_cm = np.array([-x_cm, self.ref_dist_2 - z_cm, y_cm], dtype=np.float64)
-        
-        # Apply camera pitch correction
-        cam_pos_cm = self.camera_pitch_rotation @ cam_pos_cm
-        
-        # Convert to meters and apply scaling
+        # Convert position from camera frame to robot base frame in meters
+        # (x_R = -z_C, y_R = -x_C, z_R = +y_C)
         return np.array(
             [
-                x_scaling * (cam_pos_cm[0] / 100.0),
-                y_scaling * (cam_pos_cm[1] / 100.0),
-                z_scaling * (cam_pos_cm[2] / 100.0),
+                x_scaling * (-x_cm / 100.0),
+                y_scaling * ((self.ref_dist_2 - z_cm) / 100.0),
+                z_scaling * (y_cm / 100.0),
             ],
             dtype=np.float64,
         )
-
-
     def calibrate_step_1(self, im_lm, hand_size_px, rot_mat):
         if self.image_w is None or self.image_h is None:
             print("Image size not set yet; wait for a frame before calibrating.")
@@ -449,10 +360,10 @@ class HandTracking:
     def check_stop_gesture(
             self,
             target_x: float = 0.5,
-            min_x_dist: float = 0.5,
+            min_x_dist: float = 0.6,
             max_y: float = 0.4,
-            target_quat_left: tuple = (0.51, 0.86, 0.03, -0.06),
-            target_quat_right: tuple = (-0.04, -0.31, 0.84, -0.44)) -> bool:
+            target_quat_left: tuple = (0.0, 1.0, 0.0, 0.0),
+            target_quat_right: tuple = (0.0, 0.0, 1.0, 0.0)) -> bool:
         '''
         Left Hand:
                 x=0.14 y=0.45 z=0.78
@@ -460,15 +371,6 @@ class HandTracking:
         Right Hand:
                 x=0.89 y=0.45 z=0.81
                 Qw=0.15 Qx=-0.23 Qy=0.96 Qz=0.03
-
-        Left Hand:
-                x=0.20 y=0.32 z=2.15
-                Qw=0.51 Qx=0.86 Qy=0.03 Qz=-0.06
-                Index=1.000 Pinky=1.000 Thumb=1.000
-        Right Hand:
-                x=0.87 y=0.31 z=2.11
-                Qw=-0.04 Qx=-0.31 Qy=0.84 Qz=-0.44
-                Index=1.000 Pinky=1.000 Thumb=1.000
         '''
         if self.left_hand.pose is None or self.right_hand.pose is None:
             return False
@@ -615,111 +517,40 @@ class HandTracking:
         return assigned
 
 
-    def create_trackbars(self, window_name):
-        """Create all trackbars in the window."""
-        def _noop(_val):
-            pass
-
-        scale_mult = 100
-        scale_max = 300
-        
-        # Get saved values or use defaults
-        horiz_val = self.saved_trackbar_values.get('Horiz', int(1.0 * scale_mult))
-        vert_val = self.saved_trackbar_values.get('Vert', int(1.0 * scale_mult))
-        depth_val = self.saved_trackbar_values.get('Depth', int(1.0 * scale_mult))
-        cam_pitch_val = self.saved_trackbar_values.get('CamPitch', int(self.camera_pitch_deg + 90))
-        robot_pitch_val = self.saved_trackbar_values.get('RobotPitch', int(self.robot_frame_pitch_deg + 90))
-        
-        cv2.createTrackbar('Horiz', window_name, horiz_val, scale_max, _noop)
-        cv2.createTrackbar('Vert', window_name, vert_val, scale_max, _noop)
-        cv2.createTrackbar('Depth', window_name, depth_val, scale_max, _noop)
-        cv2.createTrackbar('CamPitch', window_name, cam_pitch_val, 180, _noop)
-        cv2.createTrackbar('RobotPitch', window_name, robot_pitch_val, 180, _noop)
-
-
-    def destroy_trackbars(self, window_name):
-        """Destroy all trackbars and save their current values."""
-        trackbar_names = ['Horiz', 'Vert', 'Depth', 'CamPitch', 'RobotPitch']
-        for name in trackbar_names:
-            try:
-                self.saved_trackbar_values[name] = cv2.getTrackbarPos(name, window_name)
-            except:
-                pass
-        
-        # OpenCV doesn't have a direct way to remove trackbars, so we recreate the window
-        cv2.destroyWindow(window_name)
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 1280, 720)
-
-
-    def toggle_trackbars(self, window_name):
-        """Toggle trackbar visibility."""
-        self.trackbars_visible = not self.trackbars_visible
-        if self.trackbars_visible:
-            self.create_trackbars(window_name)
-            print("Trackbars: ON")
-        else:
-            self.destroy_trackbars(window_name)
-            print("Trackbars: OFF")
-
-
-    def toggle_overlay(self):
-        """Toggle text overlay visibility."""
-        self.overlay_visible = not self.overlay_visible
-        print(f"Overlay: {'ON' if self.overlay_visible else 'OFF'}")
-
-
-    def save_parameters(self):
-        """Save current parameters to YAML file."""
-        params = {
-            'horiz': self.saved_trackbar_values.get('Horiz', 100),
-            'vert': self.saved_trackbar_values.get('Vert', 100),
-            'depth': self.saved_trackbar_values.get('Depth', 100),
-            'cam_pitch': self.saved_trackbar_values.get('CamPitch', int(self.camera_pitch_deg + 90)),
-            'robot_pitch': self.saved_trackbar_values.get('RobotPitch', int(self.robot_frame_pitch_deg + 90)),
-        }
-        try:
-            with open(self.params_file, 'w') as f:
-                yaml.dump(params, f, default_flow_style=False)
-        except Exception as e:
-            print(f"Warning: Could not save parameters: {e}")
-
-
-    def load_parameters(self):
-        """Load parameters from YAML file if it exists."""
-        if not self.params_file.exists():
-            return
-        
-        try:
-            with open(self.params_file, 'r') as f:
-                params = yaml.safe_load(f)
-            
-            if params:
-                self.saved_trackbar_values['Horiz'] = params.get('horiz', 100)
-                self.saved_trackbar_values['Vert'] = params.get('vert', 100)
-                self.saved_trackbar_values['Depth'] = params.get('depth', 100)
-                self.saved_trackbar_values['CamPitch'] = params.get('cam_pitch', int(self.camera_pitch_deg + 90))
-                self.saved_trackbar_values['RobotPitch'] = params.get('robot_pitch', int(self.robot_frame_pitch_deg + 90))
-                print(f"Loaded parameters from {self.params_file}")
-        except Exception as e:
-            print(f"Warning: Could not load parameters: {e}")
-
-
     def tracking_loop(self):
-        cap = VideoCaptureAsync(args.video_source)
+        if args.video_source.isdigit():
+            cap = cv2.VideoCapture(int(args.video_source))  # Local camera
+        else:
+            cap = cv2.VideoCapture(args.video_source, cv2.CAP_FFMPEG)  # RTSP - MediaMTX
+
+        # Reduce internal frame buffering to 1 frame.
+        # This minimizes latency (important for real-time tracking),
+        # but may increase the chance of dropped frames if processing is slow.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Request ~30 FPS input rate.
+        # Acts as a hint; real FPS is determined by the camera/stream and may differ.
+        cap.set(cv2.CAP_PROP_FPS, 30)
+
         frame_timestamp_ms = 0
         window_name = 'Hand Tracking'
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, 1280, 720)
 
-        # Create initial trackbars
+        # UI controls: scaling sliders (trackbars)
+        # Store scaling as integer hundredths to support float-like control.
+        def _noop(_val):
+            pass
+
         scale_mult = 100
-        self.create_trackbars(window_name)
+        scale_max = 300  # 0.00 .. 3.00
+        cv2.createTrackbar('Horiz', window_name, int(1.0 * scale_mult), scale_max, _noop)
+        cv2.createTrackbar('Vert', window_name, int(1.0 * scale_mult), scale_max, _noop)
+        cv2.createTrackbar('Depth', window_name, int(1.0 * scale_mult), scale_max, _noop)
 
         while cap.isOpened():
-            image = cap.read()
-
-            if not cap.succeeded:
+            success, image = cap.read()
+            if not success:
                 break
 
             # Per-frame detections; assign them to (left, right)
@@ -728,6 +559,11 @@ class HandTracking:
             if self.mirror:
                 image = cv2.flip(image, 1)
 
+            # Read scaling factors from UI (available regardless of calibration state)
+            x_scaling = cv2.getTrackbarPos('Horiz', window_name) / scale_mult
+            y_scaling = cv2.getTrackbarPos('Vert', window_name) / scale_mult
+            z_scaling = cv2.getTrackbarPos('Depth', window_name) / scale_mult
+
             frame_timestamp_ms += 33  # ~30 FPS
 
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -735,65 +571,17 @@ class HandTracking:
             landmark_data = self.landmarker.detect_for_video(mp_image, frame_timestamp_ms)
             annotated = image.copy()
 
-            # Read scaling factors from UI (use saved values if trackbars hidden)
-            params_changed = False
-            if self.trackbars_visible:
-                x_scaling = cv2.getTrackbarPos('Horiz', window_name) / scale_mult
-                y_scaling = cv2.getTrackbarPos('Vert', window_name) / scale_mult
-                z_scaling = cv2.getTrackbarPos('Depth', window_name) / scale_mult
-                
-                # Read and update pitch angles from UI
-                camera_pitch_deg = cv2.getTrackbarPos('CamPitch', window_name) - 90
-                robot_pitch_deg = cv2.getTrackbarPos('RobotPitch', window_name) - 90
-                
-                # Check if values changed and update saved values
-                new_horiz = int(x_scaling * scale_mult)
-                new_vert = int(y_scaling * scale_mult)
-                new_depth = int(z_scaling * scale_mult)
-                new_cam_pitch = camera_pitch_deg + 90
-                new_robot_pitch = robot_pitch_deg + 90
-                
-                if (self.saved_trackbar_values.get('Horiz') != new_horiz or
-                    self.saved_trackbar_values.get('Vert') != new_vert or
-                    self.saved_trackbar_values.get('Depth') != new_depth or
-                    self.saved_trackbar_values.get('CamPitch') != new_cam_pitch or
-                    self.saved_trackbar_values.get('RobotPitch') != new_robot_pitch):
-                    params_changed = True
-                
-                self.saved_trackbar_values['Horiz'] = new_horiz
-                self.saved_trackbar_values['Vert'] = new_vert
-                self.saved_trackbar_values['Depth'] = new_depth
-                self.saved_trackbar_values['CamPitch'] = new_cam_pitch
-                self.saved_trackbar_values['RobotPitch'] = new_robot_pitch
-                
-                # Save to file if parameters changed
-                if params_changed:
-                    self.save_parameters()
-
-                # Display current scaling values and pitch angles (if overlay visible)
-                overlay_lines = [
-                    f"Horiz: {x_scaling:.2f}    Vert: {y_scaling:.2f}    Depth: {z_scaling:.2f}",
-                    f"Camera Pitch: {self.camera_pitch_deg:.1f}deg    Wrist Pitch: {self.robot_frame_pitch_deg:.1f}deg",
-                ]
-                y0 = 30
-                for i, text in enumerate(overlay_lines):
-                    org = (10, y0 + i * 25)
-                    cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
-                    cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
-            else:
-                # Use saved values when trackbars are hidden
-                x_scaling = self.saved_trackbar_values.get('Horiz', 100) / scale_mult
-                y_scaling = self.saved_trackbar_values.get('Vert', 100) / scale_mult
-                z_scaling = self.saved_trackbar_values.get('Depth', 100) / scale_mult
-                camera_pitch_deg = self.saved_trackbar_values.get('CamPitch', int(self.camera_pitch_deg + 90)) - 90
-                robot_pitch_deg = self.saved_trackbar_values.get('RobotPitch', int(self.robot_frame_pitch_deg + 90)) - 90
-            
-            if abs(camera_pitch_deg - self.camera_pitch_deg) > 0.1:
-                self.camera_pitch_deg = camera_pitch_deg
-                self.camera_pitch_rotation = R.from_euler('x', self.camera_pitch_deg, degrees=True).as_matrix()
-            if abs(robot_pitch_deg - self.robot_frame_pitch_deg) > 0.1:
-                self.robot_frame_pitch_deg = robot_pitch_deg
-                self.robot_frame_pitch_rotation = R.from_euler('x', self.robot_frame_pitch_deg, degrees=True).as_matrix()
+            # Display current scaling values
+            overlay_lines = [
+                f"Horiz: {x_scaling:.2f}",
+                f"Vert: {y_scaling:.2f}",
+                f"Depth: {z_scaling:.2f}",
+            ]
+            y0 = 30
+            for i, text in enumerate(overlay_lines):
+                org = (10, y0 + i * 25)
+                cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
 
             primary_im_lm = None
             primary_hand_size_px = None
@@ -1027,8 +815,7 @@ class HandTracking:
                         chosen_rel_rot_mat=chosen_rel,
                     )
                 else:
-                    # Detection lost - preserve last position instead of clearing
-                    hands[i].mark_not_detected()
+                    hands[i].clear()
 
             # Produce smoothed outputs (only if we have enough info)
             for i in range(2):
@@ -1040,7 +827,7 @@ class HandTracking:
                 end_active = (not start_active) and self.check_stop_gesture()
 
                 if start_active:
-                    # Keep START text visible while gesture persists (always show gesture feedback)
+                    # Keep START text visible while gesture persists.
                     cv2.putText(annotated, 'START', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3, cv2.LINE_AA)
                     if self.active_gesture != 'start':
                         self.active_gesture = 'start'
@@ -1068,7 +855,7 @@ class HandTracking:
                             self.callback_number = 0
                             self.episode_started = True
                 elif end_active:
-                    # Keep STOP text visible while gesture persists (always show gesture feedback)
+                    # Keep STOP text visible while gesture persists.
                     cv2.putText(annotated, 'STOP', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3, cv2.LINE_AA)
                     if self.active_gesture != 'stop':
                         self.active_gesture = 'stop'
@@ -1106,18 +893,17 @@ class HandTracking:
                         end_pt = (int(origin[0] + axis[0] * scale), int(origin[1] + axis[1] * scale))
                         cv2.arrowedLine(annotated, origin, end_pt, color, 3, tipLength=0.2)
 
-                # Display handedness label near each wrist (if overlay visible)
-                if self.overlay_visible:
-                    for label, hand in [('L', self.left_hand), ('R', self.right_hand)]:
-                        if hand.pose is None:
-                            continue
-                        if hand.axes is not None:
-                            origin = hand.axes[0]
-                        else:
-                            origin = (int(hand.pose[0] * self.image_w), int(hand.pose[1] * self.image_h))
-                        org = (origin[0] + 12, origin[1] - 12)
-                        cv2.putText(annotated, label, org, cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 4, cv2.LINE_AA)
-                        cv2.putText(annotated, label, org, cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2, cv2.LINE_AA)
+                # Display handedness label near each wrist
+                for label, hand in [('L', self.left_hand), ('R', self.right_hand)]:
+                    if hand.pose is None:
+                        continue
+                    if hand.axes is not None:
+                        origin = hand.axes[0]
+                    else:
+                        origin = (int(hand.pose[0] * self.image_w), int(hand.pose[1] * self.image_h))
+                    org = (origin[0] + 12, origin[1] - 12)
+                    cv2.putText(annotated, label, org, cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 4, cv2.LINE_AA)
+                    cv2.putText(annotated, label, org, cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2, cv2.LINE_AA)
 
                 # Logging print
                 for idx, hand in enumerate([self.left_hand.pose, self.right_hand.pose]):
@@ -1176,10 +962,6 @@ class HandTracking:
             key = cv2.waitKey(5) & 0xFF
             if key == 27:
                 break
-            elif key == ord('t') or key == ord('T'):
-                self.toggle_trackbars(window_name)
-            elif key == ord('o') or key == ord('O'):
-                self.toggle_overlay()
             elif key == ord('-') or key == ord('_'):
                 self.mirror = not self.mirror
                 print(f"Mirror: {'ON' if self.mirror else 'OFF'}")
