@@ -18,10 +18,7 @@ import time
 
 class VideoCaptureAsync:
     def __init__(self, video_source):
-        if video_source.isdigit():
-            cap = cv2.VideoCapture(int(video_source))  # Local camera
-        else:
-            cap = cv2.VideoCapture(video_source, cv2.CAP_FFMPEG)  # RTSP - MediaMTX
+        cap = cv2.VideoCapture(video_source, cv2.CAP_FFMPEG)  # RTSP - MediaMTX
 
         self.cap = cap
         print('\n')
@@ -146,6 +143,18 @@ class HandTracking:
         self.smoothing_window = 10
         self.left_hand = HandData('left', smoothing_window=self.smoothing_window)
         self.right_hand = HandData('right', smoothing_window=self.smoothing_window)
+
+        # Set Isaac -> Mujoco rotation matrices
+        self.left_hand.isaac_to_mujoco_rot = np.array(
+            [[0, 0, 1],
+             [-1, 0, 0],
+             [0, -1, 0]]
+        )
+        self.right_hand.isaac_to_mujoco_rot = np.array(
+            [[0, 0, -1],
+             [1, 0, 0],
+             [0, -1, 0]]
+        )
 
         # UDP setup
         self.udp_ip = udp_ip
@@ -337,7 +346,7 @@ class HandTracking:
         cam_pos_cm = self.camera_pitch_rotation @ cam_pos_cm
         
         # Convert to meters and apply scaling
-        return np.array(
+        isaac_robot = np.array(
             [
                 x_scaling * (cam_pos_cm[0] / 100.0),
                 y_scaling * (cam_pos_cm[1] / 100.0),
@@ -345,6 +354,12 @@ class HandTracking:
             ],
             dtype=np.float64,
         )
+
+        # Apply Isaac -> Mujoco rotations
+        if side == 'left':
+            return self.left_hand.isaac_to_mujoco_rot @ isaac_robot
+        else:
+            return self.right_hand.isaac_to_mujoco_rot @ isaac_robot
 
 
     def calibrate_step_1(self, im_lm, hand_size_px, rot_mat):
@@ -706,7 +721,15 @@ class HandTracking:
 
 
     def tracking_loop(self):
-        cap = VideoCaptureAsync(args.video_source)
+        cap = None
+        local_camera = False
+        if args.video_source.isdigit():
+            print(f"Opening local camera at index {args.video_source}...")
+            cap = cv2.VideoCapture(int(args.video_source))  # Local camera
+            local_camera = True
+        else:
+            cap = VideoCaptureAsync(args.video_source)
+
         frame_timestamp_ms = 0
         window_name = 'Hand Tracking'
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -717,10 +740,15 @@ class HandTracking:
         self.create_trackbars(window_name)
 
         while cap.isOpened():
-            image = cap.read()
-
-            if not cap.succeeded:
-                break
+            if local_camera:
+                success, image = cap.read()
+                if not success:
+                    print("Failed to read from camera. Exiting.")
+                    break
+            else:
+                image = cap.read()
+                if not cap.succeeded:
+                    break
 
             # Per-frame detections; assign them to (left, right)
             frame_detections: list[FrameDetection] = []
@@ -1207,8 +1235,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--udp_ip', type=str, default='127.0.0.1', help='UDP target IP')
     parser.add_argument('--udp_port', type=int, default=5005, help='UDP target port')
-    # parser.add_argument('--video_source', type=str, default='0', help='Camera index or RTSP URL (default: local webcam)')
-    parser.add_argument('--video_source', type=str, default='rtsp://127.0.0.1:8554/webcam?rtsp_transport=udp', help='Camera index or RTSP URL (default: local MediaMTX server)')
+    parser.add_argument('--video_source', type=str, default='0', help='Camera index or RTSP URL (default: local webcam)')
+    # parser.add_argument('--video_source', type=str, default='rtsp://127.0.0.1:8554/webcam?rtsp_transport=udp', help='Camera index or RTSP URL (default: local MediaMTX server)')
     args = parser.parse_args()
     ht = HandTracking(udp_ip=args.udp_ip, udp_port=args.udp_port)
     ht.tracking_loop()

@@ -38,6 +38,7 @@ class HandData:
     # Per-hand robot output offset (meters)
     robot_offset: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
 
+    isaac_to_mujoco_rot: np.ndarray = field(default_factory=lambda: np.eye(3, dtype=np.float64))
 
     def __post_init__(self) -> None:
         self.pose_history = deque(maxlen=int(self.smoothing_window))
