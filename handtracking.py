@@ -119,9 +119,6 @@ class HandTracking:
         self.f_times_H_edges = None
         self.ref_rot_mat = None
 
-        self.calibrated = False
-        self.callback_number = 0
-
         # Fixed rotation from camera frame (C) to robot base frame (B)
         # Camera is in facing the user while the robot's perspective is from it's head
         # Axes mapping: x_B = -x_C, y_B = -z_C, z_B = +y_C
@@ -199,6 +196,15 @@ class HandTracking:
         
         # Load parameters from file if it exists
         self.load_parameters()
+
+        self.is_calibrated = False
+        # Gesture states
+        self.is_activated = False
+        self.is_recording = False
+        self.is_reset = True
+
+        self.callback_number = 0
+        self.prev_callback_number = 0
 
 
     @staticmethod
@@ -403,7 +409,7 @@ class HandTracking:
         ]
 
         self.cm_per_px_2 = self.hand_height_cm / hand_size_px
-        self.calibrated = True
+        self.is_calibrated = True
         print("Calibration Step 2 completed")
 
 
@@ -417,21 +423,11 @@ class HandTracking:
         return angle
 
 
-    def check_start_gesture(
+    def check_start_position(
             self,
             target_x: float = 0.5,
             target_x_dist: float = 0.3,
-            min_y: float = 0.4,
-            target_quat_left: tuple = (0.47, 0.73, -0.27, 0.41),
-            target_quat_right: tuple = (0.51, 0.56, -0.55, 0.35)) -> bool:
-        '''
-        Left Hand:
-                x=0.34 y=0.88 z=0.28
-                Qw=0.47 Qx=0.73 Qy=-0.27 Qz=0.41
-        Right Hand:
-                x=0.65 y=0.85 z=0.34
-                Qw=0.51 Qx=0.56 Qy=-0.55 Qz=0.35
-        '''
+            min_y: float = 0.4) -> bool:
         if self.left_hand.pose is None or self.right_hand.pose is None:
             return False
 
@@ -441,27 +437,52 @@ class HandTracking:
         avg_x = (left_hand[0] + right_hand[0]) / 2
         avg_y = (left_hand[1] + right_hand[1]) / 2
         dist_x = abs(left_hand[0] - right_hand[0])
-        quat_left = [left_hand[3], left_hand[4], left_hand[5], left_hand[6]]
-        quat_right = [right_hand[3], right_hand[4], right_hand[5], right_hand[6]]
 
         # print("Start Gesture Check")
         # print(f"\tX error: {abs(avg_x - target_x):.2f}, Y: {avg_y:.2f} > {min_y}")
-        # print(f"\tLeft quat dist: {self.quaternion_distance(quat_left, target_quat_left):.2f}, Right quat dist: {self.quaternion_distance(quat_right, target_quat_right):.2f}")
-
-        left_fv = self.left_hand.finger_values
-        right_fv = self.right_hand.finger_values
-        if left_fv is None or right_fv is None:
-            return False
 
         return (abs(avg_x - target_x) < 0.2 and
                 abs(dist_x - target_x_dist) < 0.2 and
-                avg_y > min_y and
-                self.quaternion_distance(quat_left, target_quat_left) < 1.5 and
-                self.quaternion_distance(quat_right, target_quat_right) < 1.5 and
-            all(fv > 0.95 for fv in (*left_fv, *right_fv)))
+                avg_y > min_y)
 
 
-    def check_stop_gesture(
+    def check_activate_teleop_gesture(self) -> bool:
+        # Open hand in start position
+        if not (self.check_start_position() and 
+                self.left_hand.finger_values is not None and 
+                self.right_hand.finger_values is not None):
+            return False
+        all_fingers = [*self.left_hand.finger_values[:-1], *self.right_hand.finger_values[:-1]]
+        return np.mean(all_fingers) < 0.1
+
+
+    def check_record_gesture(self) -> bool:
+        # Closed hand in start position
+        if not (self.check_start_position() and 
+                self.left_hand.finger_values is not None and 
+                self.right_hand.finger_values is not None):
+            return False
+        all_fingers = [*self.left_hand.finger_values[:-1], *self.right_hand.finger_values[:-1]]
+        return np.mean(all_fingers) > 0.9
+
+
+    def check_save_gesture(self) -> bool:
+        if not (self.left_hand.finger_values is not None and 
+                self.right_hand.finger_values is not None):
+            return False
+        all_fingers = [*self.left_hand.finger_values[:-1], *self.right_hand.finger_values[:-1]]
+        return np.mean(all_fingers) < 0.1
+
+
+    def check_reset_gesture(self) -> bool:
+        if not (self.left_hand.finger_values is not None and 
+                self.right_hand.finger_values is not None):
+            return False
+        all_fingers = [*self.left_hand.finger_values[:-1], *self.right_hand.finger_values[:-1]]
+        return np.mean(all_fingers) > 0.9
+
+
+    def check_discard_gesture(
             self,
             target_x: float = 0.5,
             min_x_dist: float = 0.5,
@@ -494,10 +515,10 @@ class HandTracking:
         avg_x = (left_hand[0] + right_hand[0]) / 2
         avg_y = (left_hand[1] + right_hand[1]) / 2
         dist_x = abs(left_hand[0] - right_hand[0])
-        quat_left = [left_hand[3], left_hand[4], left_hand[5], left_hand[6]]
-        quat_right = [right_hand[3], right_hand[4], right_hand[5], right_hand[6]]
+        # quat_left = [left_hand[3], left_hand[4], left_hand[5], left_hand[6]]
+        # quat_right = [right_hand[3], right_hand[4], right_hand[5], right_hand[6]]
 
-        # print("Stop Gesture Check")
+        # print("Discard Gesture Check")
         # print(f"\tX error: {abs(avg_x - target_x):.2f}, Y: {avg_y:.2f}")
         # print(f"\tLeft quat dist: {self.quaternion_distance(quat_left, target_quat_left):.2f}, Right quat dist: {self.quaternion_distance(quat_right, target_quat_right):.2f}")
 
@@ -506,12 +527,12 @@ class HandTracking:
         if left_fv is None or right_fv is None:
             return False
 
-        return (abs(avg_x - target_x) < 0.3 and
-                dist_x > min_x_dist and
-                avg_y < max_y and
-                self.quaternion_distance(quat_left, target_quat_left) < 0.7 and
-                self.quaternion_distance(quat_right, target_quat_right) < 0.7 and
-            all(fv > 0.95 for fv in (*left_fv, *right_fv)))
+        # self.quaternion_distance(quat_left, target_quat_left) < 0.7 and
+        # self.quaternion_distance(quat_right, target_quat_right) < 0.7 and
+
+        # Raise hand up with open palm to discard
+        return avg_y < max_y and \
+               all(fv > 0.5 for fv in (*left_fv, *right_fv))
 
 
     @staticmethod
@@ -935,7 +956,7 @@ class HandTracking:
                         primary_hand_size_px = hand_size_px
                         primary_rot_mat = rot_mat_a
 
-                    if self.calibrated:
+                    if self.is_calibrated:
                         curr_sizes = []
                         est_z_values = []
                         for p_idx, _ref_size in enumerate(self.palm_sizes_1):
@@ -964,6 +985,7 @@ class HandTracking:
                         z_n = 0.0 if abs(denom) < 1e-9 else float((est_z - self.ref_dist_1) / denom)
                         cam_pos_n = np.array([x_n, y_n, z_n], dtype=np.float64)
 
+                        # Apply rotations to transform from camera to robot frame
                         rel_rot_mat_a = None
                         rel_rot_mat_b = None
                         if rot_mat_a is not None and self.ref_rot_mat is not None:
@@ -1039,6 +1061,16 @@ class HandTracking:
                         # No stable rotation available yet.
                         qw, qx, qy, qz = 1.0, 0.0, 0.0, 0.0
                     else:
+                        # Apply hand-specific axis corrections
+                        if i == 1:  # Right hand only
+                            # Pitch: +x → -x, Roll: +y unchanged, Yaw: +z → -z
+                            right_correction = np.array([
+                                [-1,  0,  0],
+                                [ 0,  1,  0],
+                                [ 0,  0, -1]
+                            ], dtype=np.float64)
+                            chosen_rel = chosen_rel @ right_correction
+                        
                         quat = R.from_matrix(chosen_rel).as_quat()  # [x, y, z, w]
                         qw, qx, qy, qz = quat[3], quat[0], quat[1], quat[2]
 
@@ -1063,66 +1095,25 @@ class HandTracking:
                 hands[i].update_smoothed_outputs()
 
             if self.left_hand.pose is not None or self.right_hand.pose is not None:
-                # Check for start and end gestures
-                start_active = self.check_start_gesture()
-                end_active = (not start_active) and self.check_stop_gesture()
-
-                if start_active:
-                    # Keep START text visible while gesture persists (always show gesture feedback)
-                    cv2.putText(annotated, 'START', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3, cv2.LINE_AA)
-                    if self.active_gesture != 'start':
-                        self.active_gesture = 'start'
-                        self.gesture_step = 0
-
-                    # Emit: 1 -> 0 (once per sustained detection)
-                    if not self.episode_started:
-                        if self.gesture_step == 0:
-                            self.callback_number = 1
-                            self.gesture_step = 1
-                            # Store starting offsets in CAMERA frame (meters). Robot conversion happens at UDP pack time.
-                            if self.left_hand.raw_cam_pos is not None and self.right_hand.raw_cam_pos is not None:
-                                self.left_hand.start_offset_cam = self.left_hand.raw_cam_pos.copy()
-                                self.right_hand.start_offset_cam = self.right_hand.raw_cam_pos.copy()
-                            print(f"Start gesture detected. Left offset: {self.left_hand.start_offset_cam}, Right offset: {self.right_hand.start_offset_cam}")
-
-                            # Reset smoothing so we don't average pre-START poses into the new rebased frame.
-                            self.left_hand.clear_histories()
-                            self.right_hand.clear_histories()
-                            if self.left_hand.pose is not None and self.right_hand.pose is not None:
-                                # Seed smoothing with the start offsets so the first rebased output is stable.
-                                self.left_hand.pose_history.append(self.with_xyz(self.left_hand.pose, self.left_hand.start_offset_cam))
-                                self.right_hand.pose_history.append(self.with_xyz(self.right_hand.pose, self.right_hand.start_offset_cam))
-                        else:
-                            self.callback_number = 0
-                            self.episode_started = True
-                elif end_active:
-                    # Keep STOP text visible while gesture persists (always show gesture feedback)
-                    cv2.putText(annotated, 'STOP', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3, cv2.LINE_AA)
-                    if self.active_gesture != 'stop':
-                        self.active_gesture = 'stop'
-                        self.gesture_step = 0
-
-                    # Emit: 2 -> 3 -> 0 (once per sustained detection)
-                    if self.episode_started:
-                        if self.gesture_step == 0:
-                            self.callback_number = 2
-                            self.gesture_step = 1
-                            # Reset the starting hand offsets to zero
-                            self.left_hand.start_offset_cam = np.zeros(3, dtype=np.float64)
-                            self.right_hand.start_offset_cam = np.zeros(3, dtype=np.float64)
-                        elif self.gesture_step == 1:
-                            self.callback_number = 3
-                            self.gesture_step = 2
-                        else:
-                            self.callback_number = 0
-                            self.episode_started = False
-                else:
-                    # No gesture detected; reset latch so the next detection replays the sequence.
-                    if not self.override_gesture:
-                        self.callback_number = 0
-                    self.override_gesture = False
-                    self.active_gesture = None
-                    self.gesture_step = 0
+                # Check for start, save, and discard gestures
+                if not self.is_activated and self.is_reset and self.check_activate_teleop_gesture():
+                    self.callback_number = 1
+                    self.is_activated = True
+                elif self.is_activated and not self.is_recording and self.is_reset and self.check_record_gesture():
+                    self.callback_number = 2
+                    self.is_recording = True
+                elif self.is_recording and self.is_reset and self.check_save_gesture():
+                    self.callback_number = 3
+                    self.is_recording = False
+                    self.is_reset = False
+                elif self.is_recording and self.is_reset and self.check_discard_gesture():
+                    self.callback_number = 4
+                    self.is_recording = False
+                    self.is_reset = False
+                elif self.is_activated and not self.is_recording and self.check_reset_gesture():
+                    self.callback_number = 5
+                    self.is_reset = True
+                    self.is_activated = False
 
                 # Draw smoothed axes
                 scale = 80
@@ -1155,11 +1146,12 @@ class HandTracking:
                     output = "Left Hand:" if idx == 0 else "Right Hand:"
                     output += f"\n\tx={hand[0]:.2f} y={hand[1]:.2f} z={hand[2]:.2f}"
                     output += f"\n\tQw={hand[3]:.2f} Qx={hand[4]:.2f} Qy={hand[5]:.2f} Qz={hand[6]:.2f}"
-                    # output += f"\n\tR={hand_rpy[0]:.1f} P={hand_rpy[1]:.1f} Y={hand_rpy[2]:.1f}\n"
+                    output += f"\n\tR={hand_rpy[0]:.1f} P={hand_rpy[1]:.1f} Y={hand_rpy[2]:.1f}\n"
                     output += f"\n\tIndex={hand[7]:.3f} Pinky={hand[8]:.3f} Thumb={hand[9]:.3f}"
                     print(output)
 
                 if self.callback_number > 0:
+                    self.prev_callback_number = self.callback_number
                     print(f"Sending callback number: {self.callback_number}")
 
                 # Send UDP message with hand pose data + callback number
@@ -1190,14 +1182,28 @@ class HandTracking:
                     left_robot = self.left_hand.robot_offset.astype(np.float64)
                     right_robot = self.right_hand.robot_offset.astype(np.float64)
 
-                left_udp = (float(left_robot[0]), float(left_robot[1]), float(left_robot[2]), *left_cam[3:])
-                right_udp = (float(right_robot[0]), float(right_robot[1]), float(right_robot[2]), *right_cam[3:])
+                # Reorder quaternion from (w,x,y,z) to (x,y,z,w) format
+                # left_cam/right_cam format: (x, y, z, qw, qx, qy, qz, finger1, finger2, finger3)
+                left_udp = (float(left_robot[0]), float(left_robot[1]), float(left_robot[2]), 
+                           left_cam[4], left_cam[5], left_cam[6], left_cam[3], *left_cam[7:])
+                right_udp = (float(right_robot[0]), float(right_robot[1]), float(right_robot[2]), 
+                            right_cam[4], right_cam[5], right_cam[6], right_cam[3], *right_cam[7:])
                 pose_data = left_udp + right_udp + (float(self.callback_number),)
 
                 msg = np.array(pose_data, dtype=np.float32).tobytes()
                 self.sock.sendto(msg, (self.udp_ip, self.udp_port))
 
                 self.callback_number = 0
+
+                # Display gesture text
+                if self.prev_callback_number == 1:
+                    cv2.putText(annotated, 'ACTIVATED', (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 3, cv2.LINE_AA)
+                elif self.prev_callback_number == 2:
+                    cv2.putText(annotated, 'RECORDING', (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 3, cv2.LINE_AA)
+                elif self.prev_callback_number == 3:
+                    cv2.putText(annotated, 'SAVED', (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3, cv2.LINE_AA)
+                elif self.prev_callback_number == 4:
+                    cv2.putText(annotated, 'DISCARDED', (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3, cv2.LINE_AA)
 
             cv2.imshow(window_name, annotated)
 
