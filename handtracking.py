@@ -194,10 +194,12 @@ class HandTracking:
         # Parameter file path
         self.params_file = Path('handtracking_params.yaml')
         
+        # Initialize calibration state before loading (may be set to True by load_parameters)
+        self.is_calibrated = False
+        
         # Load parameters from file if it exists
         self.load_parameters()
 
-        self.is_calibrated = False
         # Gesture states
         self.is_activated = False
         self.is_recording = False
@@ -411,6 +413,7 @@ class HandTracking:
         self.cm_per_px_2 = self.hand_height_cm / hand_size_px
         self.is_calibrated = True
         print("Calibration Step 2 completed")
+        self.save_parameters()
 
 
     def quaternion_distance(self, q1, q2):
@@ -666,11 +669,11 @@ class HandTracking:
         cam_pitch_val = self.saved_trackbar_values.get('CamPitch', int(self.camera_pitch_deg + 90))
         robot_pitch_val = self.saved_trackbar_values.get('RobotPitch', int(self.robot_frame_pitch_deg + 90))
         
-        cv2.createTrackbar('Horiz', window_name, horiz_val, scale_max, _noop)
-        cv2.createTrackbar('Vert', window_name, vert_val, scale_max, _noop)
-        cv2.createTrackbar('Depth', window_name, depth_val, scale_max, _noop)
-        cv2.createTrackbar('CamPitch', window_name, cam_pitch_val, 180, _noop)
-        cv2.createTrackbar('RobotPitch', window_name, robot_pitch_val, 180, _noop)
+        # cv2.createTrackbar('Horiz', window_name, horiz_val, scale_max, _noop)
+        # cv2.createTrackbar('Vert', window_name, vert_val, scale_max, _noop)
+        # cv2.createTrackbar('Depth', window_name, depth_val, scale_max, _noop)
+        # cv2.createTrackbar('CamPitch', window_name, cam_pitch_val, 180, _noop)
+        # cv2.createTrackbar('RobotPitch', window_name, robot_pitch_val, 180, _noop)
 
 
     def destroy_trackbars(self, window_name):
@@ -714,6 +717,18 @@ class HandTracking:
             'cam_pitch': self.saved_trackbar_values.get('CamPitch', int(self.camera_pitch_deg + 90)),
             'robot_pitch': self.saved_trackbar_values.get('RobotPitch', int(self.robot_frame_pitch_deg + 90)),
         }
+        
+        # Save calibration data if calibrated
+        if self.is_calibrated:
+            params['calibration'] = {
+                'palm_sizes_1': self.palm_sizes_1,
+                'cm_per_px_1': float(self.cm_per_px_1) if self.cm_per_px_1 is not None else None,
+                'ref_rot_mat': self.ref_rot_mat.tolist() if self.ref_rot_mat is not None else None,
+                'palm_sizes_2': self.palm_sizes_2,
+                'f_times_H_edges': self.f_times_H_edges,
+                'cm_per_px_2': float(self.cm_per_px_2) if self.cm_per_px_2 is not None else None,
+            }
+        
         try:
             with open(self.params_file, 'w') as f:
                 yaml.dump(params, f, default_flow_style=False)
@@ -737,6 +752,30 @@ class HandTracking:
                 self.saved_trackbar_values['CamPitch'] = params.get('cam_pitch', int(self.camera_pitch_deg + 90))
                 self.saved_trackbar_values['RobotPitch'] = params.get('robot_pitch', int(self.robot_frame_pitch_deg + 90))
                 print(f"Loaded parameters from {self.params_file}")
+                
+                # Load calibration data if available
+                if 'calibration' in params:
+                    cal = params['calibration']
+                    self.palm_sizes_1 = cal.get('palm_sizes_1')
+                    self.cm_per_px_1 = cal.get('cm_per_px_1')
+                    ref_rot_mat_list = cal.get('ref_rot_mat')
+                    if ref_rot_mat_list is not None:
+                        self.ref_rot_mat = np.array(ref_rot_mat_list, dtype=np.float64)
+                    self.palm_sizes_2 = cal.get('palm_sizes_2')
+                    self.f_times_H_edges = cal.get('f_times_H_edges')
+                    self.cm_per_px_2 = cal.get('cm_per_px_2')
+                    
+                    # Check if all calibration parameters are present
+                    if all([
+                        self.palm_sizes_1 is not None,
+                        self.cm_per_px_1 is not None,
+                        self.ref_rot_mat is not None,
+                        self.palm_sizes_2 is not None,
+                        self.f_times_H_edges is not None,
+                        self.cm_per_px_2 is not None
+                    ]):
+                        self.is_calibrated = True
+                        print("Auto-calibrated from saved parameters")
         except Exception as e:
             print(f"Warning: Could not load parameters: {e}")
 
@@ -820,15 +859,15 @@ class HandTracking:
                     self.save_parameters()
 
                 # Display current scaling values and pitch angles (if overlay visible)
-                overlay_lines = [
-                    f"Horiz: {x_scaling:.2f}    Vert: {y_scaling:.2f}    Depth: {z_scaling:.2f}",
-                    f"Camera Pitch: {self.camera_pitch_deg:.1f}deg    Wrist Pitch: {self.robot_frame_pitch_deg:.1f}deg",
-                ]
-                y0 = 30
-                for i, text in enumerate(overlay_lines):
-                    org = (10, y0 + i * 25)
-                    cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
-                    cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
+                # overlay_lines = [
+                #     f"Horiz: {x_scaling:.2f}    Vert: {y_scaling:.2f}    Depth: {z_scaling:.2f}",
+                #     f"Camera Pitch: {self.camera_pitch_deg:.1f}deg    Wrist Pitch: {self.robot_frame_pitch_deg:.1f}deg",
+                # ]
+                # y0 = 30
+                # for i, text in enumerate(overlay_lines):
+                #     org = (10, y0 + i * 25)
+                #     cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
+                #     cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
             else:
                 # Use saved values when trackbars are hidden
                 x_scaling = self.saved_trackbar_values.get('Horiz', 100) / scale_mult
@@ -1148,7 +1187,7 @@ class HandTracking:
                     output += f"\n\tQw={hand[3]:.2f} Qx={hand[4]:.2f} Qy={hand[5]:.2f} Qz={hand[6]:.2f}"
                     output += f"\n\tR={hand_rpy[0]:.1f} P={hand_rpy[1]:.1f} Y={hand_rpy[2]:.1f}\n"
                     output += f"\n\tIndex={hand[7]:.3f} Pinky={hand[8]:.3f} Thumb={hand[9]:.3f}"
-                    print(output)
+                    # print(output)
 
                 if self.callback_number > 0:
                     self.prev_callback_number = self.callback_number
@@ -1197,39 +1236,30 @@ class HandTracking:
 
                 # Display gesture text
                 if self.prev_callback_number == 1:
-                    cv2.putText(annotated, 'ACTIVATED', (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 3, cv2.LINE_AA)
+                    cv2.putText(annotated, 'ACTIVATED', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 3, cv2.LINE_AA)
                 elif self.prev_callback_number == 2:
-                    cv2.putText(annotated, 'RECORDING', (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(annotated, 'RECORDING', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 3, cv2.LINE_AA)
                 elif self.prev_callback_number == 3:
-                    cv2.putText(annotated, 'SAVED', (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3, cv2.LINE_AA)
+                    cv2.putText(annotated, 'SAVED', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3, cv2.LINE_AA)
                 elif self.prev_callback_number == 4:
-                    cv2.putText(annotated, 'DISCARDED', (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3, cv2.LINE_AA)
+                    cv2.putText(annotated, 'DISCARDED', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3, cv2.LINE_AA)
 
             cv2.imshow(window_name, annotated)
 
             key = cv2.waitKey(5) & 0xFF
             if key == 27:
                 break
-            elif key == ord('t') or key == ord('T'):
-                self.toggle_trackbars(window_name)
-            elif key == ord('o') or key == ord('O'):
-                self.toggle_overlay()
-            elif key == ord('-') or key == ord('_'):
+            elif key == ord('0'):
                 self.mirror = not self.mirror
                 print(f"Mirror: {'ON' if self.mirror else 'OFF'}")
-            elif key == ord('4') and primary_im_lm is not None:
+            elif key == ord('1') and primary_im_lm is not None:
                 self.calibrate_step_1(primary_im_lm, primary_hand_size_px, primary_rot_mat)
-            elif key == ord('5') and primary_im_lm is not None and primary_hand_size_px is not None:
+            elif key == ord('2') and primary_im_lm is not None and primary_hand_size_px is not None:
                 self.calibrate_step_2(primary_im_lm, primary_hand_size_px)
-            elif key == ord('1'):
-                self.callback_number = 1
-                self.override_gesture = True
-            elif key == ord('2'):
-                self.callback_number = 2
-                self.override_gesture = True
-            elif key == ord('3'):
-                self.callback_number = 3
-                self.override_gesture = True
+            # elif key == ord('t') or key == ord('T'):
+            #     self.toggle_trackbars(window_name)
+            # elif key == ord('o') or key == ord('O'):
+            #     self.toggle_overlay()
 
         cap.release()
         cv2.destroyAllWindows()
@@ -1241,8 +1271,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--udp_ip', type=str, default='127.0.0.1', help='UDP target IP')
     parser.add_argument('--udp_port', type=int, default=5005, help='UDP target port')
-    parser.add_argument('--video_source', type=str, default='0', help='Camera index or RTSP URL (default: local webcam)')
-    # parser.add_argument('--video_source', type=str, default='rtsp://127.0.0.1:8554/webcam?rtsp_transport=udp', help='Camera index or RTSP URL (default: local MediaMTX server)')
+    # parser.add_argument('--video_source', type=str, default='0', help='Camera index or RTSP URL (default: local webcam)')
+    parser.add_argument('--video_source', type=str, default='rtsp://127.0.0.1:8554/webcam?rtsp_transport=udp', help='Camera index or RTSP URL (default: local MediaMTX server)')
     args = parser.parse_args()
     ht = HandTracking(udp_ip=args.udp_ip, udp_port=args.udp_port)
     ht.tracking_loop()
