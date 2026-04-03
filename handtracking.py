@@ -1136,7 +1136,7 @@ class HandTracking:
 
             if self.left_hand.pose is not None or self.right_hand.pose is not None:
                 # Check for start, save, and discard gestures
-                if not self.is_activated and self.check_activate_teleop_gesture():
+                if not self.is_activated and self.is_reset and self.check_activate_teleop_gesture():
                     self.callback_number = 1
                     self.is_activated = True
                 elif self.is_activated and not self.is_recording and self.check_record_gesture():
@@ -1233,7 +1233,7 @@ class HandTracking:
                 msg = np.array(pose_data, dtype=np.float32).tobytes()
                 self.sock.sendto(msg, (self.udp_ip, self.udp_port))
 
-                self.callback_number = 0
+                # self.callback_number = 0
 
                 # Display gesture text
                 if self.prev_callback_number == 1:
