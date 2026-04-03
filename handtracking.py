@@ -456,7 +456,7 @@ class HandTracking:
                 self.right_hand.finger_values is not None):
             return False
         all_fingers = [*self.left_hand.finger_values[:-1], *self.right_hand.finger_values[:-1]]
-        return np.mean(all_fingers) < 0.3
+        return np.mean(all_fingers) < 0.2
 
 
     def check_record_gesture(self) -> bool:
@@ -466,7 +466,7 @@ class HandTracking:
                 self.right_hand.finger_values is not None):
             return False
         all_fingers = [*self.left_hand.finger_values[:-1], *self.right_hand.finger_values[:-1]]
-        return np.mean(all_fingers) > 0.7
+        return np.mean(all_fingers) > 0.8
 
 
     def check_save_gesture(self) -> bool:
@@ -474,7 +474,7 @@ class HandTracking:
                 self.right_hand.finger_values is not None):
             return False
         all_fingers = [*self.left_hand.finger_values[:-1], *self.right_hand.finger_values[:-1]]
-        return np.mean(all_fingers) < 0.3
+        return np.mean(all_fingers) < 0.2
 
 
     def check_reset_gesture(self) -> bool:
@@ -482,7 +482,7 @@ class HandTracking:
                 self.right_hand.finger_values is not None):
             return False
         all_fingers = [*self.left_hand.finger_values[:-1], *self.right_hand.finger_values[:-1]]
-        return np.mean(all_fingers) > 0.7
+        return np.mean(all_fingers) > 0.8
 
 
     def check_discard_gesture(
@@ -1188,11 +1188,11 @@ class HandTracking:
                     # output += f"\n\tQw={hand[3]:.2f} Qx={hand[4]:.2f} Qy={hand[5]:.2f} Qz={hand[6]:.2f}"
                     # output += f"\n\tR={hand_rpy[0]:.1f} P={hand_rpy[1]:.1f} Y={hand_rpy[2]:.1f}\n"
                     output += f"\n\tIndex={hand[7]:.3f} Pinky={hand[8]:.3f} Thumb={hand[9]:.3f}"
-                    print(output)
+                    # print(output)
 
                 if self.callback_number > 0:
                     self.prev_callback_number = self.callback_number
-                    print(f"Sending callback number: {self.callback_number}")
+                    # print(f"Sending callback number: {self.callback_number}")
 
                 # Send UDP message with hand pose data + callback number
                 default_pose_cam = (0.5, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
