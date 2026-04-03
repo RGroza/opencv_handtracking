@@ -203,7 +203,7 @@ class HandTracking:
         # Gesture states
         self.is_activated = False
         self.is_recording = False
-        self.is_reset = True
+        self.is_reset = False
 
         self.callback_number = 0
         self.prev_callback_number = 0
@@ -456,7 +456,7 @@ class HandTracking:
                 self.right_hand.finger_values is not None):
             return False
         all_fingers = [*self.left_hand.finger_values[:-1], *self.right_hand.finger_values[:-1]]
-        return np.mean(all_fingers) < 0.1
+        return np.mean(all_fingers) < 0.3
 
 
     def check_record_gesture(self) -> bool:
@@ -466,7 +466,7 @@ class HandTracking:
                 self.right_hand.finger_values is not None):
             return False
         all_fingers = [*self.left_hand.finger_values[:-1], *self.right_hand.finger_values[:-1]]
-        return np.mean(all_fingers) > 0.9
+        return np.mean(all_fingers) > 0.7
 
 
     def check_save_gesture(self) -> bool:
@@ -474,7 +474,7 @@ class HandTracking:
                 self.right_hand.finger_values is not None):
             return False
         all_fingers = [*self.left_hand.finger_values[:-1], *self.right_hand.finger_values[:-1]]
-        return np.mean(all_fingers) < 0.1
+        return np.mean(all_fingers) < 0.3
 
 
     def check_reset_gesture(self) -> bool:
@@ -482,7 +482,7 @@ class HandTracking:
                 self.right_hand.finger_values is not None):
             return False
         all_fingers = [*self.left_hand.finger_values[:-1], *self.right_hand.finger_values[:-1]]
-        return np.mean(all_fingers) > 0.9
+        return np.mean(all_fingers) > 0.7
 
 
     def check_discard_gesture(
@@ -1136,24 +1136,24 @@ class HandTracking:
 
             if self.left_hand.pose is not None or self.right_hand.pose is not None:
                 # Check for start, save, and discard gestures
-                if not self.is_activated and self.is_reset and self.check_activate_teleop_gesture():
+                if not self.is_activated and self.check_activate_teleop_gesture():
                     self.callback_number = 1
                     self.is_activated = True
-                elif self.is_activated and not self.is_recording and self.is_reset and self.check_record_gesture():
+                elif self.is_activated and not self.is_recording and self.check_record_gesture():
                     self.callback_number = 2
                     self.is_recording = True
-                elif self.is_recording and self.is_reset and self.check_save_gesture():
+                elif (self.is_recording or self.is_reset) and self.check_save_gesture() and not self.check_activate_teleop_gesture():
                     self.callback_number = 3
                     self.is_recording = False
                     self.is_reset = False
-                elif self.is_recording and self.is_reset and self.check_discard_gesture():
+                elif (self.is_recording or self.is_reset) and self.check_discard_gesture():
                     self.callback_number = 4
                     self.is_recording = False
                     self.is_reset = False
-                elif self.is_activated and not self.is_recording and self.check_reset_gesture():
+                elif not self.is_reset and self.check_reset_gesture() and not self.check_discard_gesture():
                     self.callback_number = 5
-                    self.is_reset = True
                     self.is_activated = False
+                    self.is_reset = True
 
                 # Draw smoothed axes
                 scale = 80
@@ -1184,11 +1184,11 @@ class HandTracking:
                         continue
                     hand_rpy = R.from_quat([hand[4], hand[5], hand[6], hand[3]]).as_euler('xyz', degrees=True)
                     output = "Left Hand:" if idx == 0 else "Right Hand:"
-                    output += f"\n\tx={hand[0]:.2f} y={hand[1]:.2f} z={hand[2]:.2f}"
-                    output += f"\n\tQw={hand[3]:.2f} Qx={hand[4]:.2f} Qy={hand[5]:.2f} Qz={hand[6]:.2f}"
-                    output += f"\n\tR={hand_rpy[0]:.1f} P={hand_rpy[1]:.1f} Y={hand_rpy[2]:.1f}\n"
+                    # output += f"\n\tx={hand[0]:.2f} y={hand[1]:.2f} z={hand[2]:.2f}"
+                    # output += f"\n\tQw={hand[3]:.2f} Qx={hand[4]:.2f} Qy={hand[5]:.2f} Qz={hand[6]:.2f}"
+                    # output += f"\n\tR={hand_rpy[0]:.1f} P={hand_rpy[1]:.1f} Y={hand_rpy[2]:.1f}\n"
                     output += f"\n\tIndex={hand[7]:.3f} Pinky={hand[8]:.3f} Thumb={hand[9]:.3f}"
-                    # print(output)
+                    print(output)
 
                 if self.callback_number > 0:
                     self.prev_callback_number = self.callback_number
