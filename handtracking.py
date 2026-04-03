@@ -185,11 +185,11 @@ class HandTracking:
         self.right_hand.robot_offset = np.array([0.15, 0.2, 0.85], dtype=np.float64)
 
         # Trackbar visibility state
-        self.trackbars_visible = True
+        self.trackbars_visible = False
         self.saved_trackbar_values = {}
         
         # Overlay visibility state
-        self.overlay_visible = True
+        self.overlay_visible = False
         
         # Parameter file path
         self.params_file = Path('handtracking_params.yaml')
@@ -669,11 +669,11 @@ class HandTracking:
         cam_pitch_val = self.saved_trackbar_values.get('CamPitch', int(self.camera_pitch_deg + 90))
         robot_pitch_val = self.saved_trackbar_values.get('RobotPitch', int(self.robot_frame_pitch_deg + 90))
         
-        # cv2.createTrackbar('Horiz', window_name, horiz_val, scale_max, _noop)
-        # cv2.createTrackbar('Vert', window_name, vert_val, scale_max, _noop)
-        # cv2.createTrackbar('Depth', window_name, depth_val, scale_max, _noop)
-        # cv2.createTrackbar('CamPitch', window_name, cam_pitch_val, 180, _noop)
-        # cv2.createTrackbar('RobotPitch', window_name, robot_pitch_val, 180, _noop)
+        cv2.createTrackbar('Horiz', window_name, horiz_val, scale_max, _noop)
+        cv2.createTrackbar('Vert', window_name, vert_val, scale_max, _noop)
+        cv2.createTrackbar('Depth', window_name, depth_val, scale_max, _noop)
+        cv2.createTrackbar('CamPitch', window_name, cam_pitch_val, 180, _noop)
+        cv2.createTrackbar('RobotPitch', window_name, robot_pitch_val, 180, _noop)
 
 
     def destroy_trackbars(self, window_name):
@@ -797,7 +797,7 @@ class HandTracking:
 
         # Create initial trackbars
         scale_mult = 100
-        self.create_trackbars(window_name)
+        # self.create_trackbars(window_name)
 
         while cap.isOpened():
             if local_camera:
@@ -859,15 +859,16 @@ class HandTracking:
                     self.save_parameters()
 
                 # Display current scaling values and pitch angles (if overlay visible)
-                # overlay_lines = [
-                #     f"Horiz: {x_scaling:.2f}    Vert: {y_scaling:.2f}    Depth: {z_scaling:.2f}",
-                #     f"Camera Pitch: {self.camera_pitch_deg:.1f}deg    Wrist Pitch: {self.robot_frame_pitch_deg:.1f}deg",
-                # ]
-                # y0 = 30
-                # for i, text in enumerate(overlay_lines):
-                #     org = (10, y0 + i * 25)
-                #     cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
-                #     cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
+                if self.overlay_visible:
+                    overlay_lines = [
+                        f"Horiz: {x_scaling:.2f}    Vert: {y_scaling:.2f}    Depth: {z_scaling:.2f}",
+                        f"Camera Pitch: {self.camera_pitch_deg:.1f}deg    Wrist Pitch: {self.robot_frame_pitch_deg:.1f}deg",
+                    ]
+                    y0 = 30
+                    for i, text in enumerate(overlay_lines):
+                        org = (10, y0 + i * 25)
+                        cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
+                        cv2.putText(annotated, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
             else:
                 # Use saved values when trackbars are hidden
                 x_scaling = self.saved_trackbar_values.get('Horiz', 100) / scale_mult
@@ -1256,10 +1257,10 @@ class HandTracking:
                 self.calibrate_step_1(primary_im_lm, primary_hand_size_px, primary_rot_mat)
             elif key == ord('2') and primary_im_lm is not None and primary_hand_size_px is not None:
                 self.calibrate_step_2(primary_im_lm, primary_hand_size_px)
-            # elif key == ord('t') or key == ord('T'):
-            #     self.toggle_trackbars(window_name)
-            # elif key == ord('o') or key == ord('O'):
-            #     self.toggle_overlay()
+            elif key == ord('t') or key == ord('T'):
+                self.toggle_trackbars(window_name)
+            elif key == ord('o') or key == ord('O'):
+                self.toggle_overlay()
 
         cap.release()
         cv2.destroyAllWindows()

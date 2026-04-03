@@ -29,8 +29,8 @@ calibration:
   - - 0.009124718476203176
     - -0.9985035754179986
     - -0.05391984226797161
-cam_pitch: -1
-depth: -1
-horiz: -1
-robot_pitch: -1
-vert: -1
+cam_pitch: 90
+depth: 100
+horiz: 100
+robot_pitch: 90
+vert: 100
