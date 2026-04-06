@@ -203,6 +203,7 @@ class HandTracking:
         # Gesture states
         self.is_activated = False
         self.is_recording = False
+        self.is_reset = True
 
         self.callback_number = 0
         self.prev_callback_number = 0
@@ -1133,22 +1134,36 @@ class HandTracking:
             for i in range(2):
                 hands[i].update_smoothed_outputs()
 
+            activate_gesture = self.check_activate_teleop_gesture()
+            record_gesture = self.check_record_gesture()
+            save_gesture = self.check_save_gesture()
+            discard_gesture = self.check_discard_gesture()
+            reset_gesture = self.check_reset_gesture()
+
             if self.left_hand.pose is not None or self.right_hand.pose is not None:
                 # Check for start, save, and discard gestures
-                if not self.is_activated and self.check_activate_teleop_gesture():
+                if not self.is_activated and self.is_reset and activate_gesture:
+                    # ACTIVATE
                     self.callback_number = 1
                     self.is_activated = True
-                elif self.is_activated and not self.is_recording and self.check_record_gesture():
+                elif self.is_activated and not self.is_recording and self.is_reset and record_gesture:
+                    # START RECORDING
                     self.callback_number = 2
                     self.is_recording = True
-                elif self.is_recording and self.check_save_gesture() and not self.check_activate_teleop_gesture():
+                elif self.is_recording and save_gesture:
+                    # SAVE RECORDING
                     self.callback_number = 3
                     self.is_recording = False
-                elif self.is_recording and self.check_discard_gesture():
+                    self.is_reset = False
+                elif self.is_recording and discard_gesture:
+                    # DISCARD RECORDING
                     self.callback_number = 4
                     self.is_recording = False
-                elif not self.is_recording and self.check_reset_gesture() and not self.check_discard_gesture():
+                    self.is_reset = False
+                elif self.is_activated and not self.is_recording and reset_gesture and not discard_gesture:
+                    # RESET
                     self.callback_number = 5
+                    self.is_reset = True
                     self.is_activated = False
 
                 # Draw smoothed axes
