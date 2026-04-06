@@ -203,7 +203,6 @@ class HandTracking:
         # Gesture states
         self.is_activated = False
         self.is_recording = False
-        self.is_reset = False
 
         self.callback_number = 0
         self.prev_callback_number = 0
@@ -1136,24 +1135,21 @@ class HandTracking:
 
             if self.left_hand.pose is not None or self.right_hand.pose is not None:
                 # Check for start, save, and discard gestures
-                if not self.is_activated and self.is_reset and self.check_activate_teleop_gesture():
+                if not self.is_activated and self.check_activate_teleop_gesture():
                     self.callback_number = 1
                     self.is_activated = True
                 elif self.is_activated and not self.is_recording and self.check_record_gesture():
                     self.callback_number = 2
                     self.is_recording = True
-                elif (self.is_recording or self.is_reset) and self.check_save_gesture() and not self.check_activate_teleop_gesture():
+                elif self.is_recording and self.check_save_gesture() and not self.check_activate_teleop_gesture():
                     self.callback_number = 3
                     self.is_recording = False
-                    self.is_reset = False
-                elif (self.is_recording or self.is_reset) and self.check_discard_gesture():
+                elif self.is_recording and self.check_discard_gesture():
                     self.callback_number = 4
                     self.is_recording = False
-                    self.is_reset = False
-                elif not self.is_reset and self.check_reset_gesture() and not self.check_discard_gesture():
+                elif not self.is_recording and self.check_reset_gesture() and not self.check_discard_gesture():
                     self.callback_number = 5
                     self.is_activated = False
-                    self.is_reset = True
 
                 # Draw smoothed axes
                 scale = 80
